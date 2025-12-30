@@ -1394,6 +1394,13 @@ class SensorNoiseResidualTest:
 
         h, w = image_gray.shape
 
+        # Validate minimum size for neighbor correlation (needs at least 3×3)
+        if h < 3 or w < 3:
+            logger.warning(f"Image too small for noise analysis: {h}×{w}. Minimum 3×3 required.")
+            noise_residual = np.zeros((h, w))
+            autocorr_2d = np.zeros((2*h-1, 2*w-1))
+            return 0.0, 1.0, noise_residual, autocorr_2d
+
         # METHOD 1: Median Filter Residual Extraction
         # Estimate signal using 3x3 median filter, subtract to get noise
         from scipy.ndimage import median_filter
@@ -1442,6 +1449,11 @@ class SensorNoiseResidualTest:
             # Fallback if sampling rate is too high
             y_samples = np.arange(1, h - 1)
             x_samples = np.arange(1, w - 1)
+            
+            # If still empty, image is too small for neighbor correlation
+            if len(y_samples) == 0 or len(x_samples) == 0:
+                logger.warning(f"Image too small for neighbor correlation: {h}×{w}")
+                return 0.0, 1.0, noise_residual, autocorr_2d
         
         # Create meshgrid for all sampled coordinates
         y_grid, x_grid = np.meshgrid(y_samples, x_samples, indexing='ij')
@@ -1491,7 +1503,12 @@ class SensorNoiseResidualTest:
         correlations = cross_mean / denominator  # (n_samples,)
         
         # Filter: only keep correlations where we have sufficient neighbors and valid std
-        valid_mask = (neighbor_std > 1e-6) & np.isfinite(correlations)
+        # Also filter out cases where center_std is too small (prevents large correlation values)
+        valid_mask = (
+            (neighbor_std > 1e-6) & 
+            (center_std > 1e-6) & 
+            np.isfinite(correlations)
+        )
         neighbor_correlations = correlations[valid_mask]
 
         # Compute mean spatial correlation
@@ -1636,6 +1653,10 @@ class ChromaticAberrationTest:
     """
 
     edge_threshold: float = Field(default=0.1, gt=0.0)
+    
+    # Constants for chromatic aberration analysis
+    ALIGNMENT_NORMALIZATION_FACTOR = 0.7  # Normalization factor for alignment scores
+    MIN_VECTOR_NORM = 1e-6  # Minimum vector norm for normalization
 
     def test(self, image_rgb: np.ndarray) -> OpticsTestResult:
         """
@@ -1940,7 +1961,7 @@ class ChromaticAberrationTest:
                     f"Non-radial CA detected (R-G alignment: {mean_alignment_rg:.2f}) - "
                     f"offset vectors are tangential (sideways), not radial - AI artifact"
                 )
-                score *= max(0.3, mean_alignment_rg / 0.7)
+                score *= max(0.3, mean_alignment_rg / self.ALIGNMENT_NORMALIZATION_FACTOR)
         
         if len(alignments_bg) > 5:
             mean_alignment_bg = np.mean(np.abs(alignments_bg))
@@ -1949,7 +1970,7 @@ class ChromaticAberrationTest:
                     f"Non-radial CA detected (B-G alignment: {mean_alignment_bg:.2f}) - "
                     f"offset vectors are tangential (sideways), not radial - AI artifact"
                 )
-                score *= max(0.3, mean_alignment_bg / 0.7)
+                score *= max(0.3, mean_alignment_bg / self.ALIGNMENT_NORMALIZATION_FACTOR)
 
         # COLOR ORDER CONSISTENCY TEST: Refractive index relationship
         #
@@ -1980,9 +2001,15 @@ class ChromaticAberrationTest:
                     rg_vec = rg_dict[(y, x)]
                     bg_vec = bg_dict[(y, x)]
                     
-                    # Normalize vectors
-                    rg_vec_norm = rg_vec / np.linalg.norm(rg_vec)
-                    bg_vec_norm = bg_vec / np.linalg.norm(bg_vec)
+                    # Normalize vectors (with protection against zero vectors)
+                    rg_norm = np.linalg.norm(rg_vec)
+                    bg_norm = np.linalg.norm(bg_vec)
+                    
+                    if rg_norm < self.MIN_VECTOR_NORM or bg_norm < self.MIN_VECTOR_NORM:
+                        continue  # Skip if vector is too small
+                    
+                    rg_vec_norm = rg_vec / rg_norm
+                    bg_vec_norm = bg_vec / bg_norm
                     
                     # Compute dot product to check direction
                     # Positive = same direction, negative = opposite direction
