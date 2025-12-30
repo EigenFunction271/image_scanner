@@ -17,10 +17,21 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 from scipy import signal
 
-from image_screener.dft import DFTProcessor
+from image_screener.dft import DFTProcessor, get_center_coords
 from image_screener.preprocessing import ImagePreprocessor
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    'OpticsConsistencyDetector',
+    'OpticsConsistencyResult',
+    'OpticsTestResult',
+    'FrequencyDomainOpticsTest',
+    'EdgePSFTest',
+    'DepthOfFieldConsistencyTest',
+    'ChromaticAberrationTest',
+    'SensorNoiseResidualTest',
+]
 
 
 class OpticsTestResult(NamedTuple):
@@ -39,6 +50,7 @@ class OpticsConsistencyResult(NamedTuple):
     edge_psf_test: OpticsTestResult
     dof_consistency_test: OpticsTestResult
     chromatic_aberration_test: OpticsTestResult
+    noise_residual_test: OpticsTestResult  # Sensor noise residual test
     explanation: str  # Human-readable explanation
 
 
@@ -51,6 +63,18 @@ class FrequencyDomainOpticsTest:
     should decay smoothly without mid-frequency bumps or high-frequency suppression.
     Also checks for missing stochastic noise floor (over-clean spectra).
     """
+    
+    # Threshold constants for OTF analysis
+    HIGH_FREQ_THRESHOLD = 0.7  # Radius threshold for high-frequency region
+    MIN_RADIUS_THRESHOLD = 0.1  # Minimum radius to consider
+    MAX_RADIUS_THRESHOLD = 0.9  # Maximum radius to consider
+    OTF_SLOPE_THRESHOLD = -0.1  # Minimum acceptable OTF decay slope
+    BUMP_RATIO_THRESHOLD = 0.1  # Maximum acceptable bump ratio (10%)
+    SUPPRESSION_RATIO_THRESHOLD = 0.15  # Maximum acceptable suppression ratio (15%)
+    RESIDUAL_STD_THRESHOLD = 0.5  # High variance threshold for non-smooth decay
+    RESIDUAL_STD_BASE = 0.3  # Base value for residual std penalty calculation
+    NOISE_FLOOR_RATIO_THRESHOLD = 0.1  # Minimum noise floor ratio (10% of expected)
+    BUMP_DETECTION_FACTOR = 1.5  # Factor for bump detection threshold
 
     def _estimate_high_frequency_variance(
         self, log_magnitude: np.ndarray, radii: np.ndarray, radial_power: np.ndarray
@@ -66,8 +90,8 @@ class FrequencyDomainOpticsTest:
         Returns:
             Estimated variance in high-frequency region
         """
-        # Focus on high frequencies (radii > 0.7)
-        high_freq_mask = radii > 0.7
+        # Focus on high frequencies
+        high_freq_mask = radii > self.HIGH_FREQ_THRESHOLD
         if np.sum(high_freq_mask) < 5:
             # If not enough high-freq data, use top 20% of frequencies
             high_freq_mask = radii > np.percentile(radii, 80)
@@ -81,7 +105,7 @@ class FrequencyDomainOpticsTest:
 
         # Also check spatial variance in high-freq region of 2D spectrum
         h, w = log_magnitude.shape
-        center_y, center_x = h // 2, w // 2
+        center_y, center_x = get_center_coords((h, w))
 
         # Create mask for high-frequency region in 2D
         y_coords, x_coords = np.ogrid[:h, :w]
@@ -89,7 +113,7 @@ class FrequencyDomainOpticsTest:
         max_distance = np.sqrt(center_y ** 2 + center_x ** 2)
         normalized_distances = distances / max_distance
 
-        high_freq_2d_mask = normalized_distances > 0.7
+        high_freq_2d_mask = normalized_distances > self.HIGH_FREQ_THRESHOLD
         if np.sum(high_freq_2d_mask) > 0:
             high_freq_2d_values = log_magnitude[high_freq_2d_mask]
             spatial_variance = np.var(high_freq_2d_values)
@@ -165,7 +189,7 @@ class FrequencyDomainOpticsTest:
 
         # Fit log-log slope to check for monotonic decay
         # Use only mid-to-high frequencies (avoid DC and very high freq noise)
-        valid_mask = (radii > 0.1) & (radii < 0.9)
+        valid_mask = (radii > self.MIN_RADIUS_THRESHOLD) & (radii < self.MAX_RADIUS_THRESHOLD)
         if np.sum(valid_mask) < 10:
             return OpticsTestResult(
                 score=0.5,
@@ -194,12 +218,12 @@ class FrequencyDomainOpticsTest:
         residuals = log_power - predicted
 
         # Detect mid-frequency bumps (positive residuals)
-        bump_threshold = np.std(residuals) * 1.5
+        bump_threshold = np.std(residuals) * self.BUMP_DETECTION_FACTOR
         bumps = np.sum(residuals > bump_threshold)
         bump_ratio = bumps / len(residuals)
 
         # Detect high-frequency suppression (negative residuals at high freq)
-        high_freq_mask = radii[valid_mask] > 0.7
+        high_freq_mask = radii[valid_mask] > self.HIGH_FREQ_THRESHOLD
         if np.sum(high_freq_mask) > 0:
             high_freq_residuals = residuals[high_freq_mask]
             suppression = np.sum(high_freq_residuals < -bump_threshold)
@@ -212,15 +236,15 @@ class FrequencyDomainOpticsTest:
         violations = []
         score = 1.0
 
-        if slope > -0.1:  # Should be clearly negative
+        if slope > self.OTF_SLOPE_THRESHOLD:
             violations.append("Non-monotonic OTF decay (slope too shallow)")
             score *= 0.5
 
-        if bump_ratio > 0.1:  # More than 10% of points are bumps
+        if bump_ratio > self.BUMP_RATIO_THRESHOLD:
             violations.append(f"Mid-frequency bumps detected ({bump_ratio:.1%})")
             score *= max(0.3, 1.0 - bump_ratio * 2)
 
-        if suppression_ratio > 0.15:
+        if suppression_ratio > self.SUPPRESSION_RATIO_THRESHOLD:
             violations.append(
                 f"High-frequency suppression detected ({suppression_ratio:.1%})"
             )
@@ -228,9 +252,9 @@ class FrequencyDomainOpticsTest:
 
         # Check smoothness of decay (low variance in residuals)
         residual_std = np.std(residuals)
-        if residual_std > 0.5:  # High variance indicates non-smooth decay
+        if residual_std > self.RESIDUAL_STD_THRESHOLD:
             violations.append("Non-smooth power spectrum decay")
-            score *= max(0.5, 1.0 - (residual_std - 0.3) * 0.5)
+            score *= max(0.5, 1.0 - (residual_std - self.RESIDUAL_STD_BASE) * 0.5)
 
         # Test for missing stochastic noise floor (over-clean spectra)
         # Real images have sensor noise that appears as variance in high frequencies
@@ -240,7 +264,7 @@ class FrequencyDomainOpticsTest:
         )
         expected_noise_floor = self._estimate_expected_noise_floor(image)
         
-        if high_freq_variance < expected_noise_floor * 0.1:  # Less than 10% of expected
+        if high_freq_variance < expected_noise_floor * self.NOISE_FLOOR_RATIO_THRESHOLD:
             violations.append(
                 f"Missing noise floor detected (variance: {high_freq_variance:.4f}, "
                 f"expected: {expected_noise_floor:.4f})"
@@ -479,7 +503,24 @@ class EdgePSFTest:
                 len(right_side) > 0 and np.any(right_side < -0.05)
             )
 
-            if has_left_negative and has_right_negative:
+            # REFINEMENT: Measure symmetry ratio to distinguish AI (symmetric) from ISP (asymmetric)
+            # AI ringing is perfectly symmetric on both sides; ISP sharpening is usually asymmetric
+            is_symmetric_ringing = False
+            if len(left_side) > 0 and len(right_side) > 0:
+                # Compute asymmetry: difference between left and right side magnitudes
+                left_magnitude = np.mean(np.abs(left_side)) if len(left_side) > 0 else 0.0
+                right_magnitude = np.mean(np.abs(right_side)) if len(right_side) > 0 else 0.0
+                total_magnitude = left_magnitude + right_magnitude
+                
+                if total_magnitude > 1e-6:
+                    asymmetry_ratio = abs(left_magnitude - right_magnitude) / total_magnitude
+                    # Low asymmetry (< 0.3) = symmetric (AI), high asymmetry (> 0.5) = asymmetric (ISP)
+                    # Only count as symmetric ringing if BOTH sides have negative lobes AND low asymmetry
+                    if has_left_negative and has_right_negative and asymmetry_ratio < 0.3:
+                        is_symmetric_ringing = True
+            
+            # Count symmetric ringing (both sides negative AND symmetric)
+            if is_symmetric_ringing:
                 symmetric_ringing_count += 1
 
             # Also check for general oscillations (alternating signs)
@@ -598,6 +639,15 @@ class DepthOfFieldConsistencyTest:
     """
 
     blur_window_size: int = Field(default=21, gt=0, ge=5)
+    
+    # Optimization constants
+    DOF_VIOLATION_RATIO_THRESHOLD = 0.1  # Maximum acceptable violation ratio (10% of triplets)
+    EDGE_DENSITY_THRESHOLD = 0.1  # Minimum edge density in window to estimate blur
+    
+    # DOF consistency test thresholds
+    MAX_GRADIENT_THRESHOLD = 2.0  # Large jumps indicate discrete blur regions (AI artifact)
+    MEAN_GRADIENT_THRESHOLD = 0.5  # Non-smooth blur variation threshold
+    THIN_LENS_VIOLATION_PENALTY = 0.4  # Strong penalty for physics violations
 
     def _check_thin_lens_consistency(
         self, blur_map: np.ndarray, valid_mask: np.ndarray
@@ -729,40 +779,69 @@ class DepthOfFieldConsistencyTest:
         sample_blur = valid_blur[sample_indices]
         sample_coords = valid_coords[sample_indices]
 
+        # OPTIMIZED: Precompute all pairwise distances and blur differences
+        # This reduces redundant calculations from O(n³) to O(n²) preprocessing + O(n³) checking
+        n_samples = len(sample_coords)
+        
+        # Precompute pairwise distances (symmetric matrix)
+        # Use vectorized operations to compute all distances at once
+        coords_array = np.array(sample_coords)
+        # Compute distance matrix using broadcasting
+        # Shape: (n_samples, n_samples, 2) -> (n_samples, n_samples)
+        diff = coords_array[:, None, :] - coords_array[None, :, :]  # (n, n, 2)
+        distances = np.linalg.norm(diff, axis=2)  # (n, n)
+        
+        # Precompute blur differences (symmetric matrix)
+        blur_array = np.array(sample_blur)
+        blur_diffs = np.abs(blur_array[:, None] - blur_array[None, :])  # (n, n)
+        
+        # Now check triplets more efficiently
         impossible_patterns = 0
-        for i in range(len(sample_coords) - 2):
-            for j in range(i + 1, len(sample_coords) - 1):
-                for k in range(j + 1, len(sample_coords)):
-                    # Get distances and blur for triplet
-                    dist_ij = np.linalg.norm(sample_coords[i] - sample_coords[j])
-                    dist_jk = np.linalg.norm(sample_coords[j] - sample_coords[k])
-                    dist_ik = np.linalg.norm(sample_coords[i] - sample_coords[k])
+        max_possible_triplets = n_samples * (n_samples - 1) * (n_samples - 2) // 6
+        threshold_ratio = max_possible_triplets * self.DOF_VIOLATION_RATIO_THRESHOLD  # Early termination threshold
+        
+        for i in range(n_samples - 2):
+            for j in range(i + 1, n_samples - 1):
+                dist_ij = distances[i, j]
+                blur_diff_ij = blur_diffs[i, j]
+                
+                # Only check k if i and j are reasonably close (optimization)
+                # Skip if i and j are very far apart (unlikely to form impossible pattern)
+                if dist_ij > np.max(distances) * 0.5:
+                    continue
+                
+                for k in range(j + 1, n_samples):
+                    # Use precomputed values
+                    dist_ik = distances[i, k]
+                    dist_jk = distances[j, k]
+                    
+                    # Early check: only proceed if i and k are close
+                    if not (dist_ik < dist_ij and dist_ik < dist_jk):
+                        continue
+                    
+                    # Use precomputed blur differences
+                    blur_diff_ik = blur_diffs[i, k]
+                    blur_diff_jk = blur_diffs[j, k]
+                    
+                    # Check for impossible pattern
+                    if (
+                        blur_diff_ik > max(blur_diff_ij, blur_diff_jk) * 1.5
+                        and min(blur_diff_ij, blur_diff_jk) < blur_diff_ik * 0.5
+                    ):
+                        impossible_patterns += 1
+                        
+                        # Early termination if we've found enough violations
+                        if impossible_patterns > threshold_ratio:
+                            break
+                
+                if impossible_patterns > threshold_ratio:
+                    break
+            
+            if impossible_patterns > threshold_ratio:
+                break
 
-                    blur_i, blur_j, blur_k = (
-                        sample_blur[i],
-                        sample_blur[j],
-                        sample_blur[k],
-                    )
-
-                    # Check for impossible pattern: if i and k are close spatially
-                    # but have very different blur, while j (between them) has opposite blur
-                    # This violates monotonicity
-                    if dist_ik < dist_ij and dist_ik < dist_jk:
-                        # i and k are close, j is farther
-                        # Expected: blur(i) ≈ blur(k), and both different from blur(j)
-                        blur_diff_ik = abs(blur_i - blur_k)
-                        blur_diff_ij = abs(blur_i - blur_j)
-                        blur_diff_jk = abs(blur_j - blur_k)
-
-                        # Impossible: i and k close but very different blur,
-                        # while j (farther) has blur similar to one of them
-                        if (
-                            blur_diff_ik > max(blur_diff_ij, blur_diff_jk) * 1.5
-                            and min(blur_diff_ij, blur_diff_jk) < blur_diff_ik * 0.5
-                        ):
-                            impossible_patterns += 1
-
-        if impossible_patterns > len(sample_coords) * 0.1:  # >10% of triplets
+        violation_threshold = max_possible_triplets * self.DOF_VIOLATION_RATIO_THRESHOLD
+        if impossible_patterns > violation_threshold:
             violations.append(
                 f"Non-monotonic blur patterns detected ({impossible_patterns} violations) - "
                 f"inconsistent with thin lens equation R ∝ |D - D_focus|"
@@ -957,9 +1036,42 @@ class DepthOfFieldConsistencyTest:
         blur_map = np.zeros((len(y_coords), len(x_coords)))
         blur_map[:] = np.nan  # Initialize with NaN
 
+        # OPTIMIZED: Precompute image gradients once for the entire image
+        # This avoids recomputing gradients in each patch
+        # Note: estimate_local_blur still computes patch gradients, but we can
+        # optimize by precomputing the full image gradient for edge detection
+        image_uint8 = (image * 255).astype(np.uint8)
+        
+        # Precompute full image edge map using Canny (used for quick edge detection)
+        # This helps us skip blur estimation at non-edge locations
+        full_edges = cv2.Canny(image_uint8, 50, 150)
+        edge_map = full_edges > 0
+        
+        # OPTIMIZED: Only estimate blur at grid points near edges
+        # This significantly reduces computation for images with sparse edges
+        half_window = self.blur_window_size // 2
+        
         for i, y in enumerate(y_coords):
             for j, x in enumerate(x_coords):
-                blur_est = self.estimate_local_blur(image, int(y), int(x))
+                y_int = int(y)
+                x_int = int(x)
+                
+                # Quick check: skip if no edges in neighborhood
+                y_min = max(0, y_int - half_window)
+                y_max = min(h, y_int + half_window + 1)
+                x_min = max(0, x_int - half_window)
+                x_max = min(w, x_int + half_window + 1)
+                
+                edge_window = edge_map[y_min:y_max, x_min:x_max]
+                edge_density = np.sum(edge_window) / edge_window.size if edge_window.size > 0 else 0.0
+                
+                # Skip blur estimation if no edges nearby (optimization)
+                if edge_density < self.EDGE_DENSITY_THRESHOLD:
+                    continue
+                
+                # Estimate blur (will still compute patch gradients, but we've filtered out
+                # most non-edge locations)
+                blur_est = self.estimate_local_blur(image, y_int, x_int)
                 if not np.isnan(blur_est):
                     blur_map[i, j] = blur_est
 
@@ -1014,7 +1126,7 @@ class DepthOfFieldConsistencyTest:
         max_gradient = np.max(blur_gradient_mag_valid) if len(blur_gradient_mag_valid) > 0 else 0.0
         mean_gradient = np.mean(blur_gradient_mag_valid) if len(blur_gradient_mag_valid) > 0 else 0.0
 
-        if max_gradient > 2.0:  # Large jumps indicate discrete blur regions (AI artifact)
+        if max_gradient > self.MAX_GRADIENT_THRESHOLD:
             violations.append(
                 f"Discrete blur regions detected (max gradient: {max_gradient:.2f} pixels/grid) - "
                 f"non-physical transition consistent with AI segmentation+blur pipeline"
@@ -1025,7 +1137,7 @@ class DepthOfFieldConsistencyTest:
         # MEAN GRADIENT TEST: Overall smoothness check
         # Real DOF: mean gradient typically < 0.3 (smooth variation)
         # AI-generated: higher mean gradient from artificial boundaries
-        if mean_gradient > 0.5:
+        if mean_gradient > self.MEAN_GRADIENT_THRESHOLD:
             violations.append(
                 f"Non-smooth blur variation (mean gradient: {mean_gradient:.2f} pixels/grid) - "
                 f"inconsistent with continuous DOF from thin lens equation"
@@ -1131,6 +1243,61 @@ class DepthOfFieldConsistencyTest:
                 )
                 score *= max(0.3, 1.0 - (uniform_ratio - 0.15) * 2)
 
+        # REFINEMENT: Test 4 - Noise Variance in Blurry Regions
+        # AI-generated blur is "clean" (low noise variance); ISP-applied blur preserves sensor noise
+        # This helps distinguish computational photography (real) from generative reconstruction (AI)
+        if len(valid_blur) > 10:
+            # Identify blurry regions (blur > median)
+            median_blur = np.nanmedian(valid_blur)
+            blurry_threshold = median_blur * 1.5
+            
+            # Map blur estimates back to image coordinates
+            blurry_regions = []
+            sharp_regions = []
+            
+            for i, y in enumerate(y_coords):
+                for j, x in enumerate(x_coords):
+                    if valid_mask[i, j]:
+                        blur_val = blur_map[i, j]
+                        # Extract local patch for noise analysis
+                        patch_size = 5
+                        y_patch_min = max(0, int(y) - patch_size // 2)
+                        y_patch_max = min(h, int(y) + patch_size // 2 + 1)
+                        x_patch_min = max(0, int(x) - patch_size // 2)
+                        x_patch_max = min(w, int(x) + patch_size // 2 + 1)
+                        
+                        if y_patch_max > y_patch_min and x_patch_max > x_patch_min:
+                            patch = image[y_patch_min:y_patch_max, x_patch_min:x_patch_max]
+                            
+                            # Compute local noise variance (high-frequency content)
+                            # Use Laplacian to detect fine detail/noise
+                            patch_uint8 = (patch * 255).astype(np.uint8)
+                            laplacian_var = cv2.Laplacian(patch_uint8, cv2.CV_64F).var()
+                            
+                            if blur_val > blurry_threshold:
+                                blurry_regions.append(laplacian_var)
+                            else:
+                                sharp_regions.append(laplacian_var)
+            
+            # Compare noise variance: blurry regions should have similar or higher variance than sharp
+            # Real ISP blur: preserves sensor noise (variance similar or higher in blurry regions)
+            # AI blur: often removes noise (variance lower in blurry regions)
+            if len(blurry_regions) > 5 and len(sharp_regions) > 5:
+                blurry_noise_var = np.mean(blurry_regions)
+                sharp_noise_var = np.mean(sharp_regions)
+                
+                # Ratio: blurry/sharp noise variance
+                # Real ISP: ratio ≈ 0.8-1.2 (noise preserved)
+                # AI blur: ratio < 0.5 (noise removed/clean blur)
+                noise_ratio = blurry_noise_var / (sharp_noise_var + 1e-10)
+                
+                if noise_ratio < 0.5:  # Blurry regions have much less noise (AI signature)
+                    violations_semantic.append(
+                        f"Clean blur detected (noise ratio: {noise_ratio:.2f}) - "
+                        f"blurry regions lack sensor noise, suggesting AI-generated blur rather than ISP"
+                    )
+                    score *= max(0.4, noise_ratio * 2)  # Penalize clean blur
+
         # Add all semantic violations
         violations.extend(violations_semantic)
 
@@ -1154,7 +1321,7 @@ class DepthOfFieldConsistencyTest:
         
         # Apply penalty for thin lens violations (very strong AI indicator)
         if thin_lens_violations:
-            score *= 0.4  # Strong penalty for physics violations
+            score *= self.THIN_LENS_VIOLATION_PENALTY
 
         score = max(0.0, min(1.0, score))
 
@@ -1171,6 +1338,292 @@ class DepthOfFieldConsistencyTest:
                 "blur_gradient_mag": blur_gradient_mag,
             },
         )
+
+
+@pydantic_dataclass
+class SensorNoiseResidualTest:
+    """Test 5: Sensor Noise Residual Test.
+
+    Distinguishes real camera sensor data from AI-generated images by analyzing
+    the spatial correlation structure of noise residuals.
+
+    PHYSICS: Real camera sensors have structural correlation in noise due to:
+    - Bayer demosaicing process (inter-pixel dependencies)
+    - Physical sensor patterns (readout noise, pixel crosstalk)
+    - ISP processing (color interpolation creates correlations)
+
+    FORENSIC SIGNATURE: AI-generated images have decorrelated noise because:
+    - Latent space reconstruction destroys inter-pixel phase relationships
+    - Generative models produce independent pixel values
+    - No physical sensor structure to preserve
+
+    This test is one of the strongest indicators for AI-generated images.
+    """
+
+    correlation_threshold: float = Field(default=0.15, ge=0.0, le=1.0)
+    
+    # Constants for noise residual analysis
+    NOISE_SAMPLE_RATE_FACTOR = 100  # Sample ~1/N of pixels for correlation computation
+    MIN_RESIDUAL_STD = 1e-6  # Minimum residual std for normalization
+    MIN_AUTOCORR_VALUE = 1e-6  # Minimum autocorrelation value for normalization
+    CORRELATION_SCALE_FACTOR = 0.3  # Scale factor for correlation score normalization
+
+    def analyze_noise_residual(
+        self, image_rgb: np.ndarray
+    ) -> Tuple[float, float, np.ndarray, np.ndarray]:
+        """
+        Analyze noise residual for spatial correlation.
+
+        Args:
+            image_rgb: RGB image (H, W, 3), float32 [0, 1]
+
+        Returns:
+            Tuple of (noise_consistency_score, decorrelation_factor, noise_residual, autocorrelation_2d)
+            - noise_consistency_score: 0.0-1.0 (1.0 = real sensor, 0.0 = AI)
+            - decorrelation_factor: 0.0-1.0 (0.0 = correlated, 1.0 = decorrelated)
+            - noise_residual: 2D array of noise residual (H, W)
+            - autocorrelation_2d: 2D autocorrelation function
+        """
+        logger.debug("Analyzing noise residual for spatial correlation")
+
+        # Convert to grayscale for noise analysis
+        if image_rgb.ndim == 3:
+            image_gray = np.mean(image_rgb, axis=2)
+        else:
+            image_gray = image_rgb.copy()
+
+        h, w = image_gray.shape
+
+        # METHOD 1: Median Filter Residual Extraction
+        # Estimate signal using 3x3 median filter, subtract to get noise
+        from scipy.ndimage import median_filter
+
+        signal_estimate = median_filter(image_gray, size=3)
+        noise_residual_median = image_gray - signal_estimate
+
+        # METHOD 2: High-Pass Filter (Laplacian) for alternative noise extraction
+        # Laplacian captures high-frequency stochastic component
+        noise_residual_laplacian = cv2.Laplacian(
+            (image_gray * 255).astype(np.uint8), cv2.CV_64F
+        ) / 255.0
+
+        # Use median filter residual as primary (more robust to edges)
+        # Normalize residual to be robust against global brightness/contrast changes
+        noise_residual = noise_residual_median.copy()
+        residual_std = np.std(noise_residual)
+        if residual_std > self.MIN_RESIDUAL_STD:
+            noise_residual = noise_residual / residual_std
+
+        # Compute 2D Autocorrelation Function (ACF)
+        # Use scipy.signal.correlate2d for efficient computation
+        # Normalize by autocorrelation at origin for correlation coefficient
+        autocorr_2d = signal.correlate2d(
+            noise_residual, noise_residual, mode="full", boundary="symm"
+        )
+        
+        # Normalize by autocorrelation at origin (center)
+        center_y, center_x = get_center_coords(autocorr_2d.shape)
+        autocorr_at_origin = autocorr_2d[center_y, center_x]
+        if abs(autocorr_at_origin) > self.MIN_AUTOCORR_VALUE:
+            autocorr_2d = autocorr_2d / autocorr_at_origin
+        else:
+            autocorr_2d = np.zeros_like(autocorr_2d)
+
+        # OPTIMIZED: Compute 8-neighbor correlation using vectorized operations
+        # For each pixel, compute correlation with its 8 immediate neighbors
+        # Sample pixels to avoid excessive computation
+        sample_rate = max(1, min(h, w) // self.NOISE_SAMPLE_RATE_FACTOR)
+        
+        # Create sampling grid (avoid boundary pixels)
+        y_samples = np.arange(1, h - 1, sample_rate)
+        x_samples = np.arange(1, w - 1, sample_rate)
+        
+        if len(y_samples) == 0 or len(x_samples) == 0:
+            # Fallback if sampling rate is too high
+            y_samples = np.arange(1, h - 1)
+            x_samples = np.arange(1, w - 1)
+        
+        # Create meshgrid for all sampled coordinates
+        y_grid, x_grid = np.meshgrid(y_samples, x_samples, indexing='ij')
+        y_flat = y_grid.flatten()
+        x_flat = x_grid.flatten()
+        
+        # Get center values for all sampled pixels (vectorized)
+        center_vals = noise_residual[y_flat, x_flat]
+        
+        # OPTIMIZED: Get all 8 neighbors at once using array slicing
+        # This avoids nested loops and list appends
+        # Shape: (n_samples, 8) for neighbor values
+        neighbors = np.zeros((len(y_flat), 8), dtype=noise_residual.dtype)
+        
+        # Extract all 8 neighbors using vectorized indexing
+        # Top row
+        neighbors[:, 0] = noise_residual[y_flat - 1, x_flat - 1]  # (-1, -1)
+        neighbors[:, 1] = noise_residual[y_flat - 1, x_flat]      # (-1, 0)
+        neighbors[:, 2] = noise_residual[y_flat - 1, x_flat + 1]  # (-1, 1)
+        # Middle row
+        neighbors[:, 3] = noise_residual[y_flat, x_flat - 1]     # (0, -1)
+        neighbors[:, 4] = noise_residual[y_flat, x_flat + 1]     # (0, 1)
+        # Bottom row
+        neighbors[:, 5] = noise_residual[y_flat + 1, x_flat - 1]  # (1, -1)
+        neighbors[:, 6] = noise_residual[y_flat + 1, x_flat]      # (1, 0)
+        neighbors[:, 7] = noise_residual[y_flat + 1, x_flat + 1]  # (1, 1)
+        
+        # OPTIMIZED: Compute correlations vectorized for all pixels at once
+        # Normalize: subtract mean of neighbors from both center and neighbors
+        neighbor_means = np.mean(neighbors, axis=1, keepdims=True)  # (n_samples, 1)
+        center_norm = center_vals[:, None] - neighbor_means  # (n_samples, 1)
+        neighbor_norm = neighbors - neighbor_means  # (n_samples, 8)
+        
+        # Compute correlation for each pixel: E[(X - μ)(Y - μ)] / (σ_X σ_Y)
+        # For correlation: center_norm is scalar, so we use |center_norm| as "std"
+        # This matches the original formula: std([center_val]) ≈ |center_val - mean(neighbors)|
+        center_std = np.abs(center_norm[:, 0])  # (n_samples,) - absolute deviation from neighbor mean
+        neighbor_std = np.std(neighbor_norm, axis=1)  # (n_samples,)
+        
+        # Compute cross-product: center_norm * neighbor_norm
+        # Shape: (n_samples, 8) -> mean along axis=1 -> (n_samples,)
+        cross_product = center_norm * neighbor_norm  # (n_samples, 8)
+        cross_mean = np.mean(cross_product, axis=1)  # (n_samples,)
+        
+        # Compute correlation coefficient: E[(X-μ)(Y-μ)] / (|X-μ| * σ_Y)
+        denominator = center_std * neighbor_std + 1e-10
+        correlations = cross_mean / denominator  # (n_samples,)
+        
+        # Filter: only keep correlations where we have sufficient neighbors and valid std
+        valid_mask = (neighbor_std > 1e-6) & np.isfinite(correlations)
+        neighbor_correlations = correlations[valid_mask]
+
+        # Compute mean spatial correlation
+        if len(neighbor_correlations) > 0:
+            mean_correlation = np.mean(neighbor_correlations)
+            std_correlation = np.std(neighbor_correlations)
+        else:
+            mean_correlation = 0.0
+            std_correlation = 0.0
+
+        # Decorrelation factor: inverse of correlation (0 = correlated, 1 = decorrelated)
+        decorrelation_factor = max(0.0, min(1.0, 1.0 - mean_correlation))
+
+        # Noise consistency score: higher correlation = higher score (real sensor)
+        # Real sensors: ρ > 0.15, AI: ρ < 0.15
+        if mean_correlation >= self.correlation_threshold:
+            # Real sensor: high correlation
+            noise_consistency_score = min(1.0, mean_correlation / self.CORRELATION_SCALE_FACTOR)
+        else:
+            # AI/synthetic: low correlation
+            noise_consistency_score = max(0.0, mean_correlation / self.correlation_threshold)
+
+        logger.debug(
+            f"Noise residual analysis: mean_correlation={mean_correlation:.4f}, "
+            f"decorrelation_factor={decorrelation_factor:.4f}, "
+            f"score={noise_consistency_score:.4f}"
+        )
+
+        return (
+            noise_consistency_score,
+            decorrelation_factor,
+            noise_residual,
+            autocorr_2d,
+        )
+
+    def test(self, image_rgb: np.ndarray) -> OpticsTestResult:
+        """
+        Test sensor noise residual consistency.
+
+        Args:
+            image_rgb: RGB image (H, W, 3), float32 [0, 1]
+
+        Returns:
+            OpticsTestResult with score and violations
+        """
+        logger.debug("Running sensor noise residual test")
+
+        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+            return OpticsTestResult(
+                score=0.5,
+                violations=["Requires RGB image for noise residual test"],
+                diagnostic_data={},
+            )
+
+        try:
+            (
+                noise_consistency_score,
+                decorrelation_factor,
+                noise_residual,
+                autocorr_2d,
+            ) = self.analyze_noise_residual(image_rgb)
+
+            violations = []
+            score = noise_consistency_score
+
+            # Compute mean correlation from decorrelation factor
+            # decorrelation_factor = 1.0 - mean_correlation, so mean_correlation = 1.0 - decorrelation_factor
+            mean_correlation = 1.0 - decorrelation_factor
+            
+            # Flag as AI if mean correlation falls below threshold
+            if mean_correlation < self.correlation_threshold:
+                violations.append(
+                    f"Low spatial correlation detected (ρ={mean_correlation:.3f} < {self.correlation_threshold}) - "
+                    f"noise is decorrelated, suggesting AI-generated image rather than real sensor data"
+                )
+                # Strong penalty for decorrelated noise
+                score *= 0.3
+
+            # Additional check: very high decorrelation (near-random noise)
+            if decorrelation_factor > 0.9:
+                violations.append(
+                    f"Extremely decorrelated noise (decorrelation={decorrelation_factor:.3f}) - "
+                    f"noise appears random, consistent with AI latent space reconstruction"
+                )
+                score *= 0.2
+
+            # Check for structural patterns in autocorrelation
+            # Real sensors: autocorrelation should have structure (Bayer patterns)
+            # AI: autocorrelation should be near-delta function (no structure)
+            center_y, center_x = get_center_coords(autocorr_2d.shape)
+            
+            # Extract autocorrelation in a small region around center (excluding center)
+            region_size = 5
+            autocorr_region = autocorr_2d[
+                center_y - region_size : center_y + region_size + 1,
+                center_x - region_size : center_x + region_size + 1,
+            ]
+            autocorr_region[region_size, region_size] = 0.0  # Exclude center
+            
+            # Real sensors: should have some structure (non-zero off-center values)
+            # AI: should be near-zero everywhere except center
+            off_center_strength = np.std(autocorr_region)
+            
+            if off_center_strength < 0.05:  # Very weak structure
+                violations.append(
+                    f"Lack of autocorrelation structure (off-center std={off_center_strength:.4f}) - "
+                    f"suggests AI-generated image with decorrelated noise"
+                )
+                score *= max(0.4, off_center_strength * 10)
+
+            if not violations:
+                violations.append("Passes sensor noise residual test")
+
+            return OpticsTestResult(
+                score=score,
+                violations=violations,
+                diagnostic_data={
+                    "noise_residual": noise_residual,
+                    "autocorrelation_2d": autocorr_2d,
+                    "mean_correlation": mean_correlation,
+                    "decorrelation_factor": decorrelation_factor,
+                    "noise_consistency_score": noise_consistency_score,
+                },
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to analyze noise residual: {e}")
+            return OpticsTestResult(
+                score=0.5,
+                violations=[f"Error in noise residual analysis: {str(e)}"],
+                diagnostic_data={},
+            )
 
 
 @pydantic_dataclass
@@ -1204,24 +1657,22 @@ class ChromaticAberrationTest:
             )
 
         h, w = image_rgb.shape[:2]
-        center_y, center_x = h // 2, w // 2
+        center_y, center_x = get_center_coords((h, w))
 
         # Extract R, G, B channels
         r_channel = image_rgb[:, :, 0]
         g_channel = image_rgb[:, :, 1]
         b_channel = image_rgb[:, :, 2]
 
-        # Convert to grayscale for edge detection
-        r_gray = (r_channel * 255).astype(np.uint8)
+        # REFINED METHOD: Detect edges only in Green channel, then find gradient shifts in R/B
+        # This ensures we compare the same physical edge across channels, avoiding
+        # false offsets from noise-induced edge detection differences.
+        
+        # Convert green channel to uint8 for edge detection
         g_gray = (g_channel * 255).astype(np.uint8)
-        b_gray = (b_channel * 255).astype(np.uint8)
-
-        # Detect edges in each channel
-        edges_r = cv2.Canny(r_gray, 50, 150)
+        
+        # Detect edges ONLY in green channel (reference)
         edges_g = cv2.Canny(g_gray, 50, 150)
-        edges_b = cv2.Canny(b_gray, 50, 150)
-
-        # Find edge pixels in green channel (reference)
         edge_coords = np.column_stack(np.where(edges_g > 0))
 
         if len(edge_coords) < 20:
@@ -1231,7 +1682,7 @@ class ChromaticAberrationTest:
                 diagnostic_data={},
             )
 
-        # Sample edges and compute offsets
+        # Sample edges and compute offsets using gradient-based matching
         sample_indices = np.linspace(
             0, len(edge_coords) - 1, min(100, len(edge_coords)), dtype=int
         )
@@ -1242,62 +1693,137 @@ class ChromaticAberrationTest:
         rg_offset_vectors = []  # Store tuples: (offset_vec, (y, x)) for radial alignment check
         bg_offset_vectors = []  # Store tuples: (offset_vec, (y, x)) for radial alignment check
 
+        # Compute gradients for R and B channels (for gradient shift detection)
+        # Use Sobel operator for more robust gradient computation
+        r_grad_y = cv2.Sobel(r_channel, cv2.CV_64F, 0, 1, ksize=3)
+        r_grad_x = cv2.Sobel(r_channel, cv2.CV_64F, 1, 0, ksize=3)
+        r_grad_mag = np.sqrt(r_grad_x**2 + r_grad_y**2)
+        
+        b_grad_y = cv2.Sobel(b_channel, cv2.CV_64F, 0, 1, ksize=3)
+        b_grad_x = cv2.Sobel(b_channel, cv2.CV_64F, 1, 0, ksize=3)
+        b_grad_mag = np.sqrt(b_grad_x**2 + b_grad_y**2)
+        
+        # Also compute gradient direction in Green channel (for perpendicular search)
+        g_grad_y = cv2.Sobel(g_channel, cv2.CV_64F, 0, 1, ksize=3)
+        g_grad_x = cv2.Sobel(g_channel, cv2.CV_64F, 1, 0, ksize=3)
+
         for idx in sample_indices:
             y, x = edge_coords[idx]
+            
+            # Skip if too close to image boundaries
+            if y < 2 or y >= h - 2 or x < 2 or x >= w - 2:
+                continue
 
             # Compute radial distance from center
             dy = y - center_y
             dx = x - center_x
             radial_dist = np.sqrt(dx**2 + dy**2)
-            radial_distances.append(radial_dist)
 
-            # Check for corresponding edge in R and B channels
-            # Look in small neighborhood
+            # Get edge orientation from Green channel gradient
+            # Perpendicular direction (rotate gradient 90 degrees) is along the edge
+            gx = g_grad_x[y, x]
+            gy = g_grad_y[y, x]
+            
+            if abs(gx) < 1e-6 and abs(gy) < 1e-6:
+                continue
+            
+            # Perpendicular direction (along which CA shift occurs)
+            perp_x = -gy  # Rotate 90 degrees
+            perp_y = gx
+            perp_norm = np.sqrt(perp_x**2 + perp_y**2)
+            if perp_norm < 1e-6:
+                continue
+            
+            perp_x /= perp_norm
+            perp_y /= perp_norm
+
+            # Search for maximum gradient shift in R and B channels
+            # along the perpendicular direction (where CA shift occurs)
             search_radius = 3
-            y_min = max(0, y - search_radius)
-            y_max = min(h, y + search_radius + 1)
-            x_min = max(0, x - search_radius)
-            x_max = min(w, x + search_radius + 1)
-
-            r_patch = edges_r[y_min:y_max, x_min:x_max]
-            b_patch = edges_b[y_min:y_max, x_min:x_max]
-
-            # Find closest edge pixel
-            r_coords = np.column_stack(np.where(r_patch > 0))
-            b_coords = np.column_stack(np.where(b_patch > 0))
-
-            # Store offset vectors with corresponding edge locations
-            if len(r_coords) > 0:
-                # Offset relative to patch center
-                r_offset_y = r_coords[0, 0] - search_radius
-                r_offset_x = r_coords[0, 1] - search_radius
-                rg_offset = np.sqrt(r_offset_y**2 + r_offset_x**2)
+            search_positions = np.arange(-search_radius, search_radius + 0.5, 0.5)  # Sub-pixel resolution
+            
+            # R-G offset detection
+            r_grad_along_perp = []
+            r_positions = []
+            for shift in search_positions:
+                # Sample at sub-pixel location using bilinear interpolation
+                y_shifted = y + shift * perp_y
+                x_shifted = x + shift * perp_x
+                
+                # Bounds check
+                if y_shifted < 1 or y_shifted >= h - 1 or x_shifted < 1 or x_shifted >= w - 1:
+                    continue
+                
+                # Bilinear interpolation for gradient magnitude
+                y0, y1 = int(np.floor(y_shifted)), int(np.ceil(y_shifted))
+                x0, x1 = int(np.floor(x_shifted)), int(np.ceil(x_shifted))
+                dy_frac = y_shifted - y0
+                dx_frac = x_shifted - x0
+                
+                grad_val = (
+                    r_grad_mag[y0, x0] * (1 - dx_frac) * (1 - dy_frac) +
+                    r_grad_mag[y0, x1] * dx_frac * (1 - dy_frac) +
+                    r_grad_mag[y1, x0] * (1 - dx_frac) * dy_frac +
+                    r_grad_mag[y1, x1] * dx_frac * dy_frac
+                )
+                
+                r_grad_along_perp.append(grad_val)
+                r_positions.append(shift)
+            
+            # Find position of maximum gradient (edge location in R channel)
+            if len(r_grad_along_perp) > 0:
+                max_idx = np.argmax(r_grad_along_perp)
+                r_shift = r_positions[max_idx]
+                
+                # Compute offset vector
+                r_offset_x = r_shift * perp_x
+                r_offset_y = r_shift * perp_y
+                rg_offset = abs(r_shift)  # Magnitude
+                
                 rg_offsets.append(rg_offset)
-                
-                # Store offset vector with edge location for radial alignment check
-                if rg_offset > 0:
-                    offset_vec = np.array([r_offset_x, r_offset_y])
-                    rg_offset_vectors.append((offset_vec, (y, x)))
-                else:
-                    rg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
+                radial_distances.append(radial_dist)  # Only append if we found R offset
+                offset_vec = np.array([r_offset_x, r_offset_y])
+                rg_offset_vectors.append((offset_vec, (y, x)))
             else:
-                # No R edge found, but store location for consistency
                 rg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
-
-            if len(b_coords) > 0:
-                b_offset_y = b_coords[0, 0] - search_radius
-                b_offset_x = b_coords[0, 1] - search_radius
-                bg_offset = np.sqrt(b_offset_y**2 + b_offset_x**2)
-                bg_offsets.append(bg_offset)
+            
+            # B-G offset detection (same method)
+            b_grad_along_perp = []
+            b_positions = []
+            for shift in search_positions:
+                y_shifted = y + shift * perp_y
+                x_shifted = x + shift * perp_x
                 
-                # Store offset vector with edge location for radial alignment check
-                if bg_offset > 0:
-                    offset_vec = np.array([b_offset_x, b_offset_y])
-                    bg_offset_vectors.append((offset_vec, (y, x)))
-                else:
-                    bg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
+                if y_shifted < 1 or y_shifted >= h - 1 or x_shifted < 1 or x_shifted >= w - 1:
+                    continue
+                
+                y0, y1 = int(np.floor(y_shifted)), int(np.ceil(y_shifted))
+                x0, x1 = int(np.floor(x_shifted)), int(np.ceil(x_shifted))
+                dy_frac = y_shifted - y0
+                dx_frac = x_shifted - x0
+                
+                grad_val = (
+                    b_grad_mag[y0, x0] * (1 - dx_frac) * (1 - dy_frac) +
+                    b_grad_mag[y0, x1] * dx_frac * (1 - dy_frac) +
+                    b_grad_mag[y1, x0] * (1 - dx_frac) * dy_frac +
+                    b_grad_mag[y1, x1] * dx_frac * dy_frac
+                )
+                
+                b_grad_along_perp.append(grad_val)
+                b_positions.append(shift)
+            
+            if len(b_grad_along_perp) > 0:
+                max_idx = np.argmax(b_grad_along_perp)
+                b_shift = b_positions[max_idx]
+                
+                b_offset_x = b_shift * perp_x
+                b_offset_y = b_shift * perp_y
+                bg_offset = abs(b_shift)
+                
+                bg_offsets.append(bg_offset)
+                offset_vec = np.array([b_offset_x, b_offset_y])
+                bg_offset_vectors.append((offset_vec, (y, x)))
             else:
-                # No B edge found, but store location for consistency
                 bg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
 
         if len(rg_offsets) < 5 or len(bg_offsets) < 5:
@@ -1359,7 +1885,14 @@ class ChromaticAberrationTest:
         
         # Check R-G alignment
         for offset_vec, (y, x) in rg_offset_vectors:
-            if offset_vec.size == 2 and np.linalg.norm(offset_vec) > 0.01:
+            offset_magnitude = np.linalg.norm(offset_vec) if offset_vec.size == 2 else 0.0
+            
+            # REFINEMENT: Add magnitude threshold - if ISP removed 99% of CA, remaining is mostly noise
+            # Don't penalize alignment if total offset is < 0.5 pixels (likely noise, not real CA)
+            if offset_magnitude < 0.5:
+                continue  # Skip small offsets that are likely noise
+            
+            if offset_vec.size == 2 and offset_magnitude > 0.01:
                 # Compute radial vector from center to edge location
                 dy = y - center_y
                 dx = x - center_x
@@ -1369,7 +1902,7 @@ class ChromaticAberrationTest:
                 if radial_vec_norm > 0.01:
                     # Normalize both vectors
                     radial_vec_normalized = radial_vec / radial_vec_norm
-                    offset_vec_normalized = offset_vec / np.linalg.norm(offset_vec)
+                    offset_vec_normalized = offset_vec / offset_magnitude
                     
                     # Compute alignment: dot product (should be ±1 for radial)
                     # Alignment = (Offset · Radius) / (|Offset| |Radius|)
@@ -1378,7 +1911,13 @@ class ChromaticAberrationTest:
         
         # Check B-G alignment
         for offset_vec, (y, x) in bg_offset_vectors:
-            if offset_vec.size == 2 and np.linalg.norm(offset_vec) > 0.01:
+            offset_magnitude = np.linalg.norm(offset_vec) if offset_vec.size == 2 else 0.0
+            
+            # REFINEMENT: Add magnitude threshold - skip small offsets (< 0.5 pixels) that are likely noise
+            if offset_magnitude < 0.5:
+                continue  # Skip small offsets that are likely noise
+            
+            if offset_vec.size == 2 and offset_magnitude > 0.01:
                 dy = y - center_y
                 dx = x - center_x
                 radial_vec = np.array([dx, dy])
@@ -1386,7 +1925,7 @@ class ChromaticAberrationTest:
                 
                 if radial_vec_norm > 0.01:
                     radial_vec_normalized = radial_vec / radial_vec_norm
-                    offset_vec_normalized = offset_vec / np.linalg.norm(offset_vec)
+                    offset_vec_normalized = offset_vec / offset_magnitude
                     alignment = np.dot(offset_vec_normalized, radial_vec_normalized)
                     alignments_bg.append(alignment)
         
@@ -1510,10 +2049,11 @@ class OpticsConsistencyDetector:
     Combines all four tests to produce an overall optics consistency score.
     """
 
-    frequency_weight: float = Field(default=0.3, ge=0.0, le=1.0)
-    edge_psf_weight: float = Field(default=0.25, ge=0.0, le=1.0)
-    dof_weight: float = Field(default=0.25, ge=0.0, le=1.0)
-    ca_weight: float = Field(default=0.2, ge=0.0, le=1.0)
+    frequency_weight: float = Field(default=0.25, ge=0.0, le=1.0)
+    edge_psf_weight: float = Field(default=0.2, ge=0.0, le=1.0)
+    dof_weight: float = Field(default=0.2, ge=0.0, le=1.0)
+    ca_weight: float = Field(default=0.15, ge=0.0, le=1.0)
+    noise_residual_weight: float = Field(default=0.2, ge=0.0, le=1.0)
 
     def __post_init__(self):
         """Initialize test components."""
@@ -1521,6 +2061,7 @@ class OpticsConsistencyDetector:
         self.edge_psf_test = EdgePSFTest()
         self.dof_test = DepthOfFieldConsistencyTest()
         self.ca_test = ChromaticAberrationTest()
+        self.noise_residual_test = SensorNoiseResidualTest()
 
         # Normalize weights
         total_weight = (
@@ -1528,12 +2069,14 @@ class OpticsConsistencyDetector:
             + self.edge_psf_weight
             + self.dof_weight
             + self.ca_weight
+            + self.noise_residual_weight
         )
         if total_weight > 0:
             self.frequency_weight /= total_weight
             self.edge_psf_weight /= total_weight
             self.dof_weight /= total_weight
             self.ca_weight /= total_weight
+            self.noise_residual_weight /= total_weight
 
     def analyze(
         self, image_path: str, load_rgb: bool = True
@@ -1582,10 +2125,16 @@ class OpticsConsistencyDetector:
 
         if image_rgb is not None:
             ca_result = self.ca_test.test(image_rgb)
+            noise_residual_result = self.noise_residual_test.test(image_rgb)
         else:
             ca_result = OpticsTestResult(
                 score=0.5,
                 violations=["RGB image required for CA test"],
+                diagnostic_data={},
+            )
+            noise_residual_result = OpticsTestResult(
+                score=0.5,
+                violations=["RGB image required for noise residual test"],
                 diagnostic_data={},
             )
 
@@ -1595,6 +2144,7 @@ class OpticsConsistencyDetector:
             + edge_psf_result.score * self.edge_psf_weight
             + dof_result.score * self.dof_weight
             + ca_result.score * self.ca_weight
+            + noise_residual_result.score * self.noise_residual_weight
         )
 
         # Generate explanation
@@ -1615,6 +2165,10 @@ class OpticsConsistencyDetector:
             all_violations.extend(
                 [f"CA: {v}" for v in ca_result.violations if "Passes" not in v]
             )
+        if noise_residual_result.violations:
+            all_violations.extend(
+                [f"Noise: {v}" for v in noise_residual_result.violations if "Passes" not in v]
+            )
 
         if all_violations:
             explanation = "; ".join(all_violations)
@@ -1627,6 +2181,7 @@ class OpticsConsistencyDetector:
             edge_psf_test=edge_psf_result,
             dof_consistency_test=dof_result,
             chromatic_aberration_test=ca_result,
+            noise_residual_test=noise_residual_result,
             explanation=explanation,
         )
 

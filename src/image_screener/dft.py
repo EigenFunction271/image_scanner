@@ -12,7 +12,7 @@ from scipy.ndimage import maximum_filter
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['DFTProcessor', 'SpectralPeak', 'ProcessImageResult']
+__all__ = ['DFTProcessor', 'SpectralPeak', 'ProcessImageResult', 'get_center_coords']
 
 # Peak detection parameters
 MAX_PEAKS_TO_RETAIN = 1000  # Limit peaks to avoid noise and improve performance
