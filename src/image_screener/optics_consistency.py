@@ -1227,14 +1227,19 @@ class DepthOfFieldConsistencyTest:
 
     def test(self, image: np.ndarray) -> OpticsTestResult:
         """
-        Test depth-of-field consistency (CONDITIONAL TEST).
+        Test depth-of-field consistency (CONDITIONAL TEST WITH SOFT SCORING).
         
         First checks for usable blur evidence:
         - Presence of textured background
         - Presence of strong defocus gradients
         
-        If no blur evidence found, skips or downweights DOF test
-        (don't force it to "fail" deep-focus/clean-background portraits).
+        Uses soft scoring based on evidence ratio:
+        - Low evidence: Partial credit (neutral score weighted by evidence)
+        - Moderate evidence: DOF test score weighted by evidence
+        - High evidence: Full DOF test score
+        
+        This prevents false positives for deep-focus/clean-background images while
+        still providing useful information when some blur evidence exists.
 
         Args:
             image: Grayscale image (H, W), float32 [0, 1]
@@ -1242,33 +1247,49 @@ class DepthOfFieldConsistencyTest:
         Returns:
             OpticsTestResult with score and violations
         """
-        logger.debug("Running depth-of-field consistency test (conditional)")
+        logger.debug("Running depth-of-field consistency test (conditional with soft scoring)")
 
-        # CONDITIONAL TEST: Check for usable blur evidence first
+        # Check for usable blur evidence first
         has_evidence, evidence_ratio = self._check_blur_evidence(image)
         
+        # SOFT SCORING: Use evidence_ratio to weight the test
+        # evidence_ratio ranges from 0.0 (no evidence) to 1.0 (strong evidence)
+        
         if not has_evidence:
-            # No usable blur evidence - skip DOF test or downweight
-            # This prevents false positives for deep-focus/clean-background images
+            # Low evidence: Give partial credit based on evidence ratio
+            # This prevents false positives while still acknowledging limited evidence
             logger.debug(
-                f"Insufficient blur evidence (ratio: {evidence_ratio:.3f} < {self.MIN_BLUR_EVIDENCE_RATIO}) - "
-                f"skipping DOF test to avoid false positives"
+                f"Low blur evidence (ratio: {evidence_ratio:.3f} < {self.MIN_BLUR_EVIDENCE_RATIO}) - "
+                f"using soft scoring with evidence weight"
             )
+            
+            # Soft score: Interpolate between neutral (1.0) and a conservative penalty
+            # As evidence_ratio approaches 0, score approaches 1.0 (neutral)
+            # As evidence_ratio approaches MIN_BLUR_EVIDENCE_RATIO, score approaches 0.9 (slight penalty)
+            # This gives partial credit for minimal evidence
+            evidence_weight = evidence_ratio / self.MIN_BLUR_EVIDENCE_RATIO if self.MIN_BLUR_EVIDENCE_RATIO > 0 else 0.0
+            evidence_weight = min(1.0, max(0.0, evidence_weight))  # Clamp to [0, 1]
+            
+            # Soft score: 1.0 (neutral) when evidence_weight=0, 0.9 (slight penalty) when evidence_weight=1
+            soft_score = 1.0 - (0.1 * evidence_weight)
+            
             return OpticsTestResult(
-                score=1.0,  # Neutral score (no penalty for lack of blur evidence)
+                score=soft_score,
                 violations=[
-                    f"DOF test skipped: insufficient blur evidence "
-                    f"(textured background or defocus gradients not detected) - "
+                    f"DOF test: Low blur evidence (ratio: {evidence_ratio:.3f}) - "
+                    f"using soft scoring (score: {soft_score:.3f}) - "
                     f"this is normal for deep-focus or clean-background images"
                 ],
                 diagnostic_data={
-                    "skipped": True,
+                    "skipped": False,
+                    "soft_scoring": True,
                     "evidence_ratio": evidence_ratio,
-                    "reason": "insufficient_blur_evidence"
+                    "evidence_weight": evidence_weight,
+                    "reason": "low_blur_evidence_soft_scoring"
                 },
             )
 
-        logger.debug(f"Blur evidence detected (ratio: {evidence_ratio:.3f}) - proceeding with DOF test")
+        logger.debug(f"Blur evidence detected (ratio: {evidence_ratio:.3f}) - proceeding with DOF test (soft scoring)")
 
         h, w = image.shape
 
@@ -1552,6 +1573,42 @@ class DepthOfFieldConsistencyTest:
 
         score = max(0.0, min(1.0, score))
 
+        # SOFT SCORING: Weight the final score by evidence_ratio
+        # This gives partial credit when evidence is moderate (between threshold and 1.0)
+        # Full credit when evidence_ratio is high (close to 1.0)
+        # The evidence_ratio was computed earlier in the function
+        if has_evidence:
+            # Compute evidence confidence: how much above the minimum threshold
+            # evidence_ratio ranges from MIN_BLUR_EVIDENCE_RATIO to 1.0
+            # Map to confidence weight: 0.0 (at threshold) to 1.0 (strong evidence)
+            evidence_range = 1.0 - self.MIN_BLUR_EVIDENCE_RATIO
+            if evidence_range > 0:
+                evidence_confidence = (evidence_ratio - self.MIN_BLUR_EVIDENCE_RATIO) / evidence_range
+                evidence_confidence = max(0.0, min(1.0, evidence_confidence))  # Clamp to [0, 1]
+            else:
+                evidence_confidence = 1.0  # If threshold is 1.0, use full confidence
+            
+            # Soft scoring: Interpolate between neutral (1.0) and computed score
+            # When evidence_confidence is low (just above threshold), give partial credit
+            # When evidence_confidence is high (close to 1.0), use full computed score
+            # Minimum confidence weight: 0.7 (even at threshold, give 70% weight to computed score)
+            # This ensures we still use the DOF test results even with moderate evidence
+            confidence_weight = 0.7 + (0.3 * evidence_confidence)  # Range: [0.7, 1.0]
+            
+            # Soft score: Blend neutral score (1.0) with computed score
+            # Higher confidence → more weight on computed score
+            soft_score = (1.0 - confidence_weight) * 1.0 + confidence_weight * score
+            
+            logger.debug(
+                f"Soft scoring applied: evidence_ratio={evidence_ratio:.3f}, "
+                f"evidence_confidence={evidence_confidence:.3f}, "
+                f"confidence_weight={confidence_weight:.3f}, "
+                f"computed_score={score:.3f}, final_score={soft_score:.3f}"
+            )
+            
+            score = soft_score
+            score = max(0.0, min(1.0, score))  # Final clamp
+
         if not violations:
             violations.append("Passes DOF consistency test")
 
@@ -1563,6 +1620,8 @@ class DepthOfFieldConsistencyTest:
                 "y_coords": y_coords,
                 "x_coords": x_coords,
                 "blur_gradient_mag": blur_gradient_mag,
+                "evidence_ratio": evidence_ratio if has_evidence else None,
+                "soft_scoring": has_evidence,  # Indicate soft scoring was applied
             },
         )
 
