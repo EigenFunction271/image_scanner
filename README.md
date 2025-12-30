@@ -19,11 +19,25 @@ Experimental image forensics tool designed to distinguish between natural photog
 - Detects lack of sensor PRNU and VAE artifacts
 - Statistical moment extraction from wavelet subbands
 
-### Optics Consistency Detector (NEW)
-- **Frequency-domain optics test** - Validates monotonic OTF decay
-- **Edge Spread Function (ESF) test** - Analyzes PSF consistency and detects ringing artifacts
-- **Depth-of-field consistency** - Checks spatial smoothness of blur variation
-- **Chromatic aberration test** - Validates non-zero, spatially coherent CA
+### Optics Consistency Detector
+- **Frequency-domain optics test** - Validates monotonic OTF decay with enhanced metrics:
+  - High-frequency noise floor energy analysis
+  - Mid-band bump detection (upsampling artifacts)
+  - Spatial stationarity analysis (uniform spectral structure detection)
+- **Edge Spread Function (ESF) test** - Analyzes PSF consistency:
+  - Asymmetry metric to distinguish AI diffusion ringing (symmetric) from ISP sharpening (asymmetric)
+  - Ringing detection with improved forensic logic
+- **Depth-of-field consistency** (Conditional Test):
+  - Checks for usable blur evidence before running test
+  - Frequency attenuation method (Laplacian/Gradient energy ratio)
+  - Prevents false positives on deep-focus images
+- **Chromatic aberration test** (Conditional Test):
+  - Resolution-aware testing (subpixel CA needs high resolution)
+  - Accounts for modern ISP correction
+- **Sensor noise residual test** - Analyzes spatial correlation of noise:
+  - FFT-based autocorrelation (100x faster than direct correlation)
+  - 8-neighbor correlation analysis
+  - Detects decorrelated noise patterns (AI signature)
 - Physics-first approach based on optical laws that real cameras must follow
 
 ## Installation
@@ -128,6 +142,9 @@ The optics detector:
 - Generates diagnostic plots showing all test results
 - Provides human-readable explanations of violations
 - Validates physical optical laws that real cameras must follow
+- Uses conditional testing to avoid false positives:
+  - DOF test only runs when blur evidence is present
+  - CA test accounts for resolution and ISP correction
 
 ### Programmatic Usage
 
@@ -165,10 +182,11 @@ print(f"Azimuthal Average: {result.azimuthal_average}")
 from image_screener.optics_consistency import OpticsConsistencyDetector
 
 detector = OpticsConsistencyDetector(
-    frequency_weight=0.3,
-    edge_psf_weight=0.25,
-    dof_weight=0.25,
-    ca_weight=0.2
+    frequency_weight=0.25,
+    edge_psf_weight=0.2,
+    dof_weight=0.2,
+    ca_weight=0.15,
+    noise_residual_weight=0.2
 )
 
 result = detector.analyze("path/to/image.jpg")
@@ -181,6 +199,7 @@ print(f"Frequency Test: {result.frequency_test.score:.4f}")
 print(f"Edge PSF Test: {result.edge_psf_test.score:.4f}")
 print(f"DOF Test: {result.dof_consistency_test.score:.4f}")
 print(f"CA Test: {result.chromatic_aberration_test.score:.4f}")
+print(f"Noise Residual Test: {result.noise_residual_test.score:.4f}")
 
 # Violations
 print(f"Explanation: {result.explanation}")
@@ -246,8 +265,14 @@ The tool uses multiple complementary methods:
 ### Performance
 
 - Default settings: 98th percentile threshold, top 1000 peaks
-- Processing time: ~1-3 seconds per 512×512 image
+- Processing time: ~1-3 seconds per 512×512 image (Spectral Peak Detector)
+- Optics Consistency Detector: ~2-4 seconds per 512×512 image
+  - Noise residual test: ~0.1-0.2 seconds (optimized with FFT-based autocorrelation)
 - Memory: Minimal (in-place operations where possible)
+- Optimizations:
+  - Vectorized operations for grid pattern analysis
+  - FFT-based autocorrelation for noise residual (100x faster)
+  - Conditional testing to skip tests when evidence is insufficient
 
 ## References
 

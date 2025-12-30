@@ -9,8 +9,9 @@ This document provides detailed descriptions of all detection methods implemente
 3. [Optics Consistency Detector](#optics-consistency-detector)
    - [Frequency-Domain Optics Test](#1-frequency-domain-optics-test)
    - [Edge Spread Function (ESF) Test](#2-edge-spread-function-esf-test)
-   - [Depth-of-Field Consistency Test](#3-depth-of-field-consistency-test)
-   - [Chromatic Aberration Test](#4-chromatic-aberration-test)
+   - [Depth-of-Field Consistency Test](#3-depth-of-field-consistency-test-conditional)
+   - [Chromatic Aberration Test](#4-chromatic-aberration-test-conditional)
+   - [Sensor Noise Residual Test](#5-sensor-noise-residual-test)
 
 ---
 
@@ -141,12 +142,23 @@ The Optics Consistency Detector validates whether an image follows physical opti
 - **Mid-frequency bumps**: Positive residuals indicating artificial enhancements
 - **High-frequency suppression**: Negative residuals at high frequencies (unnatural filtering)
 - **Non-smooth decay**: High variance in residuals
+- **Unnaturally low high-frequency energy**: Over-clean noise floor (AI signature)
+- **Unnaturally uniform high-frequency tail**: Artificial smoothing (low variance in tail)
+- **Mid-band energy bumps**: Elevated mid-band energy relative to expected decay (upsampling artifacts)
+- **Uniform spectral shape across image**: Low spatial variance in spectral structure (AI uniformity)
+
+**Enhanced Metrics**:
+1. **High-frequency noise floor energy**: Real sensors have stochastic variation; AI often has unnaturally low or uniform tail
+2. **Mid-band bump ratio**: Detects elevated mid-band energy (characteristic of upsampling artifacts)
+3. **Spatial stationarity**: Measures variance in spectral shape across image quadrants (AI tends to be more uniform)
 
 **Scoring**:
 - Penalize bumps, suppression, and non-smooth decay
+- Penalize unnaturally clean or uniform noise floor
+- Penalize mid-band bumps and uniform spatial structure
 - Score: 0.0 (fails) to 1.0 (passes)
 
-**Physical Basis**: Real camera optics create smooth, monotonic frequency response. AI post-processing or synthetic generation often introduces non-physical frequency characteristics.
+**Physical Basis**: Real camera optics create smooth, monotonic frequency response with natural noise floor variation. AI post-processing or synthetic generation often introduces non-physical frequency characteristics, unnaturally clean tails, or uniform spectral structure.
 
 ---
 
@@ -162,30 +174,48 @@ The Optics Consistency Detector validates whether an image follows physical opti
 
 **Violations Detected**:
 - **Ringing**: Oscillations in ESF (alternating signs in LSF)
-- **Negative lobes**: Significant negative values in LSF (non-physical PSF)
+- **Even-symmetric ringing**: Low asymmetry with negative lobes on both sides (AI diffusion artifacts)
 - **Inconsistent PSF width**: High variation in PSF width across image
+
+**Enhanced Metric - Asymmetry Analysis**:
+- **Asymmetry score**: Measures symmetry of LSF around peak
+  - Low asymmetry (< 0.3) with negative lobes on both sides → AI diffusion ringing (symmetric)
+  - High asymmetry (> 0.5) → Real ISP sharpening (one-sided halos, less suspicious)
+  - Medium asymmetry (0.3-0.5) → Ambiguous, less penalty
+- Replaces simple negative lobe detection with forensic asymmetry analysis
 
 **Scoring**:
 - Penalize ringing (oscillation ratio > 30%)
-- Penalize negative lobes (> 15% negative values)
+- Strongly penalize symmetric ringing (low asymmetry + negative lobes on both sides)
 - Penalize inconsistent width (CV > 0.5)
 - Score: 0.0 (fails) to 1.0 (passes)
 
-**Physical Basis**: Real camera PSF is smooth and positive. Ringing and negative lobes indicate non-physical processing or synthetic generation.
+**Physical Basis**: Real camera PSF is smooth and positive. ISP sharpening creates asymmetric halos. AI diffusion models create even-symmetric ringing (negative lobes on both sides with low asymmetry), which is a strong AI signature.
 
 ---
 
-### 3. Depth-of-Field Consistency Test
+### 3. Depth-of-Field Consistency Test (Conditional)
 
 **Purpose**: Check spatial smoothness of blur variation (depth-of-field).
 
+**Conditional Testing**: 
+- First checks for usable blur evidence:
+  - Presence of textured background (high local variance)
+  - Presence of strong defocus gradients (spatial variation in blur)
+- If insufficient evidence, test is skipped (neutral score) to avoid false positives
+- Prevents penalizing deep-focus or clean-background images
+
 **Method**:
-1. Estimate local blur radius at sampled grid points
-   - Compute gradient magnitude in local window
-   - Blur radius inversely related to gradient strength
-2. Create blur map across image
-3. Compute spatial gradient of blur map
-4. Check for discrete jumps or semantic patterns
+1. **Blur Evidence Check**: Verify image has sufficient texture or defocus gradients
+2. Estimate local blur radius using **frequency attenuation method**:
+   - Compute Laplacian energy (high-frequency content)
+   - Compute gradient energy (low-frequency content)
+   - Blur radius from ratio: Laplacian/Gradient
+   - Sharp regions: High ratio (> 2.0) → blur ≈ 0-1 pixels
+   - Blurry regions: Low ratio (< 0.5) → blur ≈ 3-8 pixels
+3. Create blur map across image at grid points
+4. Compute spatial gradient of blur map
+5. Check for discrete jumps or semantic patterns
 
 **Violations Detected**:
 - **Discrete blur regions**: Large jumps in blur (max gradient > 2.0)
@@ -193,55 +223,114 @@ The Optics Consistency Detector validates whether an image follows physical opti
 - **Semantic blur patterns**: Bimodal distribution (e.g., all foreground sharp, all background blurry)
 
 **Scoring**:
-- Penalize discrete jumps and high variation
+- If insufficient blur evidence: Score = 1.0 (neutral, test skipped)
+- Otherwise: Penalize discrete jumps and high variation
 - Penalize semantic patterns (CV > 0.8)
-- Score: 0.0 (fails) to 1.0 (passes)
+- Score: 0.0 (fails) to 1.0 (passes or skipped)
 
-**Physical Basis**: Real DOF varies continuously with depth. Discrete or semantic blur regions indicate post-processing or synthetic generation.
+**Physical Basis**: Real DOF varies continuously with depth. Discrete or semantic blur regions indicate post-processing or synthetic generation. However, deep-focus images or clean backgrounds may legitimately have little blur variation.
 
 ---
 
-### 4. Chromatic Aberration Test
+### 4. Chromatic Aberration Test (Conditional)
 
 **Purpose**: Validate non-zero, spatially coherent chromatic aberration.
 
+**Conditional Testing**:
+- **Resolution-aware**: Subpixel CA requires high resolution
+  - Below 512px: Test is low-confidence (likely resized/re-encoded)
+  - Below 1024px: Radial consistency test may be unreliable
+- **ISP Correction Aware**: Modern phones correct CA in ISP
+  - Low CA magnitude is NOT suspicious (expected after correction)
+  - Test focuses on radial consistency rather than magnitude
+
 **Method**:
 1. Load RGB image and extract R, G, B channels
-2. Detect edges in each channel using Canny
-3. Use green channel as reference
-4. For each edge in green, find corresponding edge in R and B channels
-5. Compute edge offsets (R-G and B-G)
-6. Analyze offset patterns
+2. Detect edges ONLY in green channel (reference)
+3. For each edge in green, find corresponding edge in R and B using gradient-based matching
+4. Compute edge offsets (R-G and B-G) along perpendicular direction
+5. Analyze offset patterns:
+   - Radial consistency (CA should increase with radius)
+   - Spatial coherence (offsets should be spatially correlated)
 
 **Violations Detected**:
-- **Zero CA**: Mean offsets < 0.1 pixels (suspicious - real cameras have CA)
 - **Non-physical radial variation**: Negative slope (CA should increase with radius)
 - **Uniform CA**: Low variance in offsets (suspiciously uniform)
 - **Non-coherent CA**: High variance (> 1.0 pixel) indicating random offsets
+- **Note**: Zero CA is NOT penalized (expected after ISP correction)
 
 **Scoring**:
-- Penalize zero CA (score × 0.3)
-- Penalize non-physical variation
-- Penalize uniform or non-coherent CA
+- Low resolution (< 512px): Test marked as low-confidence
+- Penalize non-physical variation and non-coherent CA
 - Score: 0.0 (fails) to 1.0 (passes)
 
-**Physical Basis**: Real cameras have small but non-zero chromatic aberration that varies radially and spatially. Zero CA or perfectly uniform CA indicates synthetic generation or heavy post-processing.
+**Physical Basis**: Real cameras have small but non-zero chromatic aberration that varies radially and spatially. However, modern ISP correction often removes CA, so low magnitude is not suspicious. Radial consistency and spatial coherence are more reliable indicators.
+
+---
+
+### 5. Sensor Noise Residual Test
+
+**Purpose**: Analyze spatial correlation structure of noise residuals to distinguish real camera sensor data from AI-generated images.
+
+**Physical Basis**:
+- **Real sensors**: Have structural correlation in noise due to:
+  - Bayer demosaicing process (inter-pixel dependencies)
+  - Physical sensor patterns (readout noise, pixel crosstalk)
+  - ISP processing (color interpolation creates correlations)
+- **AI-generated images**: Have decorrelated noise because:
+  - Latent space reconstruction destroys inter-pixel phase relationships
+  - Generative models produce independent pixel values
+  - No physical sensor structure to preserve
+
+**Method**:
+1. **Noise Extraction**:
+   - Use 3×3 median filter to estimate signal
+   - Subtract from original to get noise residual
+   - Normalize by standard deviation
+2. **2D Autocorrelation** (FFT-optimized):
+   - Compute autocorrelation using FFT: `IFFT(FFT(x) * conj(FFT(x)))`
+   - O(n log n) complexity vs O(n²) for direct correlation
+   - Extract 11×11 region around center for structure analysis
+3. **8-Neighbor Correlation**:
+   - Sample pixels (adaptive sampling rate)
+   - Compute correlation with 8 immediate neighbors (vectorized)
+   - Measure spatial correlation strength
+4. **Structure Analysis**:
+   - Check off-center autocorrelation strength
+   - Real sensors: Should have structure (Bayer patterns)
+   - AI: Should be near-delta function (no structure)
+
+**Violations Detected**:
+- **Low spatial correlation**: Mean correlation < 0.15 (decorrelated noise)
+- **Extremely decorrelated noise**: Decorrelation factor > 0.9 (near-random)
+- **Lack of autocorrelation structure**: Low off-center std (< 0.05)
+
+**Scoring**:
+- Real sensors: High correlation (ρ > 0.15) → High score
+- AI/synthetic: Low correlation (ρ < 0.15) → Low score
+- Score: 0.0 (AI) to 1.0 (real sensor)
+
+**Performance**:
+- FFT-based autocorrelation: ~0.1-0.2 seconds for 512×512 image
+- 100x faster than direct correlation method
+- Vectorized neighbor correlation computation
 
 ---
 
 ## Combined Scoring
 
-The Optics Consistency Detector combines all four tests with configurable weights:
+The Optics Consistency Detector combines all five tests with configurable weights:
 
 ```
-optics_score = w1 * frequency_score + w2 * psf_score + w3 * dof_score + w4 * ca_score
+optics_score = w1 * frequency_score + w2 * psf_score + w3 * dof_score + w4 * ca_score + w5 * noise_score
 ```
 
 **Default weights**:
-- Frequency: 0.3
-- PSF: 0.25
-- DOF: 0.25
-- CA: 0.2
+- Frequency: 0.25
+- PSF: 0.2
+- DOF: 0.2
+- CA: 0.15
+- Noise Residual: 0.2
 
 **Interpretation**:
 - **Score ≥ 0.7**: Likely real image (passes most tests)
@@ -262,16 +351,29 @@ optics_score = w1 * frequency_score + w2 * psf_score + w3 * dof_score + w4 * ca_
 
 ### Performance
 
-- **Optics Detector**: ~2-5 seconds per 512×512 image
+- **Optics Detector**: ~2-4 seconds per 512×512 image
+  - Frequency test: ~0.5-1s
+  - Edge PSF test: ~0.5-1s
+  - DOF test: ~0.5-1s (conditional, may skip)
+  - CA test: ~0.5-1s (conditional, requires RGB)
+  - Noise residual test: ~0.1-0.2s (FFT-optimized)
 - **Spectral Peak Detector**: ~1-3 seconds per image
 - **Wavelet Detector**: ~1-2 seconds per image (plus training time)
+
+**Optimizations**:
+- FFT-based autocorrelation for noise residual (100x faster)
+- Vectorized operations for grid pattern analysis
+- Conditional testing to skip tests when evidence is insufficient
+- Adaptive sampling for neighbor correlation
 
 ### Limitations
 
 1. **Image Quality**: Works best on high-quality images (not heavily compressed)
 2. **Post-processing**: Heavy JPEG compression or filtering can affect results
-3. **CA Test**: Requires RGB image (skipped for grayscale)
+3. **CA Test**: Requires RGB image (skipped for grayscale), resolution-aware
 4. **Edge Detection**: Requires sufficient edges for PSF analysis
+5. **DOF Test**: Conditional - requires blur evidence (may skip deep-focus images)
+6. **Noise Residual Test**: Requires sufficient image size (minimum 3×3)
 
 ---
 
