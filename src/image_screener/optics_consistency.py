@@ -1239,6 +1239,8 @@ class ChromaticAberrationTest:
         rg_offsets = []
         bg_offsets = []
         radial_distances = []
+        rg_offset_vectors = []  # Store tuples: (offset_vec, (y, x)) for radial alignment check
+        bg_offset_vectors = []  # Store tuples: (offset_vec, (y, x)) for radial alignment check
 
         for idx in sample_indices:
             y, x = edge_coords[idx]
@@ -1264,18 +1266,39 @@ class ChromaticAberrationTest:
             r_coords = np.column_stack(np.where(r_patch > 0))
             b_coords = np.column_stack(np.where(b_patch > 0))
 
+            # Store offset vectors with corresponding edge locations
             if len(r_coords) > 0:
                 # Offset relative to patch center
                 r_offset_y = r_coords[0, 0] - search_radius
                 r_offset_x = r_coords[0, 1] - search_radius
                 rg_offset = np.sqrt(r_offset_y**2 + r_offset_x**2)
                 rg_offsets.append(rg_offset)
+                
+                # Store offset vector with edge location for radial alignment check
+                if rg_offset > 0:
+                    offset_vec = np.array([r_offset_x, r_offset_y])
+                    rg_offset_vectors.append((offset_vec, (y, x)))
+                else:
+                    rg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
+            else:
+                # No R edge found, but store location for consistency
+                rg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
 
             if len(b_coords) > 0:
                 b_offset_y = b_coords[0, 0] - search_radius
                 b_offset_x = b_coords[0, 1] - search_radius
                 bg_offset = np.sqrt(b_offset_y**2 + b_offset_x**2)
                 bg_offsets.append(bg_offset)
+                
+                # Store offset vector with edge location for radial alignment check
+                if bg_offset > 0:
+                    offset_vec = np.array([b_offset_x, b_offset_y])
+                    bg_offset_vectors.append((offset_vec, (y, x)))
+                else:
+                    bg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
+            else:
+                # No B edge found, but store location for consistency
+                bg_offset_vectors.append((np.array([0.0, 0.0]), (y, x)))
 
         if len(rg_offsets) < 5 or len(bg_offsets) < 5:
             return OpticsTestResult(
@@ -1321,6 +1344,146 @@ class ChromaticAberrationTest:
         if rg_std > 1.0 or bg_std > 1.0:
             violations.append("Non-coherent chromatic aberration")
             score *= max(0.5, 1.0 - (max(rg_std, bg_std) - 0.5) * 0.2)
+
+        # RADIAL ALIGNMENT TEST: Lateral CA must be radial (toward/away from center)
+        #
+        # PHYSICS: Real lateral CA is radial - the offset vector (Δx, Δy) must point
+        # directly toward or away from the image center (c_x, c_y).
+        #
+        # FORENSIC TEST: Calculate alignment = (Offset · Radius) / (|Offset| |Radius|)
+        # - Alignment ≈ ±1: Radial (correct, physical)
+        # - Alignment ≈ 0: Tangential (non-physical, AI artifact)
+        #
+        alignments_rg = []
+        alignments_bg = []
+        
+        # Check R-G alignment
+        for offset_vec, (y, x) in rg_offset_vectors:
+            if offset_vec.size == 2 and np.linalg.norm(offset_vec) > 0.01:
+                # Compute radial vector from center to edge location
+                dy = y - center_y
+                dx = x - center_x
+                radial_vec = np.array([dx, dy])
+                radial_vec_norm = np.linalg.norm(radial_vec)
+                
+                if radial_vec_norm > 0.01:
+                    # Normalize both vectors
+                    radial_vec_normalized = radial_vec / radial_vec_norm
+                    offset_vec_normalized = offset_vec / np.linalg.norm(offset_vec)
+                    
+                    # Compute alignment: dot product (should be ±1 for radial)
+                    # Alignment = (Offset · Radius) / (|Offset| |Radius|)
+                    alignment = np.dot(offset_vec_normalized, radial_vec_normalized)
+                    alignments_rg.append(alignment)
+        
+        # Check B-G alignment
+        for offset_vec, (y, x) in bg_offset_vectors:
+            if offset_vec.size == 2 and np.linalg.norm(offset_vec) > 0.01:
+                dy = y - center_y
+                dx = x - center_x
+                radial_vec = np.array([dx, dy])
+                radial_vec_norm = np.linalg.norm(radial_vec)
+                
+                if radial_vec_norm > 0.01:
+                    radial_vec_normalized = radial_vec / radial_vec_norm
+                    offset_vec_normalized = offset_vec / np.linalg.norm(offset_vec)
+                    alignment = np.dot(offset_vec_normalized, radial_vec_normalized)
+                    alignments_bg.append(alignment)
+        
+        # Check alignment scores
+        # Real CA: alignment close to ±1 (radial)
+        # AI/fake CA: alignment close to 0 (tangential/sideways)
+        if len(alignments_rg) > 5:
+            mean_alignment_rg = np.mean(np.abs(alignments_rg))
+            # If mean alignment < 0.7, CA is too tangential (non-physical)
+            if mean_alignment_rg < 0.7:
+                violations.append(
+                    f"Non-radial CA detected (R-G alignment: {mean_alignment_rg:.2f}) - "
+                    f"offset vectors are tangential (sideways), not radial - AI artifact"
+                )
+                score *= max(0.3, mean_alignment_rg / 0.7)
+        
+        if len(alignments_bg) > 5:
+            mean_alignment_bg = np.mean(np.abs(alignments_bg))
+            if mean_alignment_bg < 0.7:
+                violations.append(
+                    f"Non-radial CA detected (B-G alignment: {mean_alignment_bg:.2f}) - "
+                    f"offset vectors are tangential (sideways), not radial - AI artifact"
+                )
+                score *= max(0.3, mean_alignment_bg / 0.7)
+
+        # COLOR ORDER CONSISTENCY TEST: Refractive index relationship
+        #
+        # PHYSICS: Refractive indices follow Cauchy's equation: n_blue > n_green > n_red
+        # This means:
+        # - Blue light is refracted MORE than green (B-G offset larger, opposite direction)
+        # - Red light is refracted LESS than green (R-G offset smaller, opposite direction)
+        # - B-G and R-G offsets should typically point in OPPOSITE directions
+        #
+        # FORENSIC TEST: If Blue and Red are both shifted the same way relative to Green,
+        # the "lens" is physically impossible.
+        #
+        if len(rg_offset_vectors) > 5 and len(bg_offset_vectors) > 5:
+            # Compare directions of R-G and B-G offsets
+            # They should point in opposite directions (or have specific ratio)
+            same_direction_count = 0
+            total_comparisons = 0
+            
+            # Match R-G and B-G vectors by edge location
+            rg_dict = {(y, x): vec for vec, (y, x) in rg_offset_vectors if np.linalg.norm(vec) > 0.01}
+            bg_dict = {(y, x): vec for vec, (y, x) in bg_offset_vectors if np.linalg.norm(vec) > 0.01}
+            
+            # Find common edge locations
+            common_locations = set(rg_dict.keys()) & set(bg_dict.keys())
+            
+            if len(common_locations) > 5:
+                for y, x in common_locations:
+                    rg_vec = rg_dict[(y, x)]
+                    bg_vec = bg_dict[(y, x)]
+                    
+                    # Normalize vectors
+                    rg_vec_norm = rg_vec / np.linalg.norm(rg_vec)
+                    bg_vec_norm = bg_vec / np.linalg.norm(bg_vec)
+                    
+                    # Compute dot product to check direction
+                    # Positive = same direction, negative = opposite direction
+                    direction_dot = np.dot(rg_vec_norm, bg_vec_norm)
+                    
+                    # For real CA: n_blue > n_green > n_red
+                    # B-G and R-G should point in opposite directions (negative dot product)
+                    # Or at least not strongly in the same direction
+                    if direction_dot > 0.5:  # Strongly same direction = impossible
+                        same_direction_count += 1
+                    total_comparisons += 1
+                
+                if total_comparisons > 0:
+                    same_direction_ratio = same_direction_count / total_comparisons
+                    
+                    # If >30% of offsets point in same direction, suspicious
+                    if same_direction_ratio > 0.3:
+                        violations.append(
+                            f"Color order inconsistency detected ({same_direction_ratio:.1%} same-direction offsets) - "
+                            f"B-G and R-G offsets should point opposite (n_blue > n_green > n_red) - physically impossible"
+                        )
+                        score *= max(0.2, 1.0 - same_direction_ratio * 2)
+                    
+                    # Also check magnitude relationship
+                    # Typically: |B-G offset| > |R-G offset| (blue refracted more)
+                    rg_magnitudes = [np.linalg.norm(rg_dict[loc]) for loc in common_locations]
+                    bg_magnitudes = [np.linalg.norm(bg_dict[loc]) for loc in common_locations]
+                    
+                    if len(rg_magnitudes) > 5 and len(bg_magnitudes) > 5:
+                        mean_rg_mag = np.mean(rg_magnitudes)
+                        mean_bg_mag = np.mean(bg_magnitudes)
+                        
+                        # Blue should typically be refracted more (larger offset)
+                        # But if R-G is consistently larger, suspicious
+                        if mean_rg_mag > mean_bg_mag * 1.5:
+                            violations.append(
+                                f"Unusual CA magnitude relationship (R-G: {mean_rg_mag:.2f}, B-G: {mean_bg_mag:.2f}) - "
+                                f"red refracted more than blue contradicts n_blue > n_red"
+                            )
+                            score *= 0.7
 
         score = max(0.0, min(1.0, score))
 

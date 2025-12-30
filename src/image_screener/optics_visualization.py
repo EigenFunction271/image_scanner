@@ -29,12 +29,12 @@ def create_optics_diagnostics_plot(
         show_plot: Whether to display plot interactively
     """
     fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.5)
 
     # Title
+    filename = Path(image_path).name
     fig.suptitle(
-        f"Optics Consistency Analysis\n{Path(image_path).name}\n"
-        f"Overall Score: {result.optics_score:.3f}",
+        f'Analysis of "{filename}": Overall Score {result.optics_score:.3f}',
         fontsize=16,
         fontweight="bold",
     )
@@ -106,10 +106,10 @@ def create_optics_diagnostics_plot(
         )
         ax2.grid(True, alpha=0.3)
 
-        # Combine legends
+        # Combine legends - place at bottom right to avoid overlap with violation text
         lines = line1 + line2
         labels = [l.get_label() for l in lines]
-        ax2.legend(lines, labels, loc="upper right")
+        ax2.legend(lines, labels, loc="lower right")
 
         # Add violations text
         violations_text = "\n".join(result.edge_psf_test.violations[:2])
