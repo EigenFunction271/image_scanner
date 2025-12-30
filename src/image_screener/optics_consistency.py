@@ -1302,7 +1302,7 @@ class DepthOfFieldConsistencyTest:
 
         return violations
 
-    def _check_blur_evidence(self, image: np.ndarray) -> Tuple[bool, float]:
+    def _check_blur_evidence(self, image: np.ndarray, gradient_cache: Optional[dict] = None) -> Tuple[bool, float]:
         """
         Check if there's usable blur evidence in the image.
         
@@ -1312,6 +1312,7 @@ class DepthOfFieldConsistencyTest:
         
         Args:
             image: Grayscale image (H, W), float32 [0, 1]
+            gradient_cache: Optional dict for caching gradients (keyed by image hash)
             
         Returns:
             Tuple of (has_evidence, evidence_ratio)
@@ -1336,10 +1337,17 @@ class DepthOfFieldConsistencyTest:
         # We'll use the full texture_map but sample for threshold comparison
         
         # Method 2: Check for defocus gradients
-        # OPTIMIZED: Cache gradient computation for potential reuse
-        # Compute gradient magnitude to detect spatial variation
-        # Note: This gradient could be cached if used in other tests on the same image
-        gy, gx = np.gradient(image)
+        # OPTIMIZED: Use cached gradient if available
+        image_hash = hash((image.shape, image.dtype, tuple(image.flat[:100]))) if gradient_cache is not None else None
+        
+        if gradient_cache is not None and image_hash in gradient_cache:
+            logger.debug("  Using cached gradient for blur evidence check")
+            gy, gx = gradient_cache[image_hash]
+        else:
+            gy, gx = np.gradient(image)
+            if gradient_cache is not None and image_hash is not None:
+                gradient_cache[image_hash] = (gy, gx)
+        
         gradient_mag = np.sqrt(gx**2 + gy**2)
         
         # Defocus gradients: high spatial variation in gradient magnitude
@@ -1476,7 +1484,8 @@ class DepthOfFieldConsistencyTest:
         logger.debug("Running depth-of-field consistency test (conditional with soft scoring)")
 
         # Check for usable blur evidence first
-        has_evidence, evidence_ratio = self._check_blur_evidence(image)
+        # Note: gradient_cache is not available at test level, but could be passed from detector
+        has_evidence, evidence_ratio = self._check_blur_evidence(image, gradient_cache=None)
         
         # SOFT SCORING: Use evidence_ratio to weight the test
         # evidence_ratio ranges from 0.0 (no evidence) to 1.0 (strong evidence)
@@ -1499,8 +1508,10 @@ class DepthOfFieldConsistencyTest:
         logger.debug("  Estimating blur using frequency attenuation (Laplacian/Gradient energy ratio)...")
         
         processed_count = 0
+        # OPTIMIZED: Reduce logging frequency in tight loop
+        log_interval = max(10, len(y_coords) // 5)  # Log 5 times total
         for i, y in enumerate(y_coords):
-            if i % 5 == 0 and i > 0:
+            if i % log_interval == 0 and i > 0:
                 logger.debug(f"  Processing row {i}/{len(y_coords)} ({processed_count} blur estimates so far)...")
             for j, x in enumerate(x_coords):
                 y_int = int(y)
@@ -2415,9 +2426,12 @@ class ChromaticAberrationTest:
         g_grad_x = cv2.Sobel(g_channel, cv2.CV_64F, 1, 0, ksize=3)
         logger.debug("  ✓ Gradients computed")
 
-        logger.debug(f"Processing edge samples (0/{len(sample_indices)})...")
+        # OPTIMIZED: Reduce logging frequency in tight loop
+        log_interval = max(20, len(sample_indices) // 5)  # Log 5 times total
+        if len(sample_indices) > 10:
+            logger.debug(f"Processing {len(sample_indices)} edge samples for CA detection...")
         for sample_idx, idx in enumerate(sample_indices):
-            if (sample_idx + 1) % 20 == 0:
+            if (sample_idx + 1) % log_interval == 0:
                 logger.debug(f"  Processing edge {sample_idx + 1}/{len(sample_indices)}...")
             y, x = edge_coords[idx]
             
@@ -2921,6 +2935,10 @@ class OpticsConsistencyDetector:
         logger.info(f"  ✓ Edge PSF test complete: score={edge_psf_result.score:.4f}")
 
         logger.info("Step 5/6: Running DOF consistency test (this may take a moment)...")
+        # OPTIMIZED: Precompute gradient once and cache it (for potential reuse)
+        self._get_cached_gradient(preprocessed)  # Precompute and cache
+        # Note: DOF test will use its own gradient computation for now
+        # Future: Refactor to pass gradient_cache to test methods
         dof_result = self.dof_test.test(preprocessed)
         logger.info(f"  ✓ DOF test complete: score={dof_result.score:.4f}")
 
