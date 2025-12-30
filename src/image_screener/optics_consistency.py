@@ -70,7 +70,12 @@ class FrequencyDomainOpticsTest:
     HIGH_FREQ_THRESHOLD = 0.7  # Radius threshold for high-frequency region
     MIN_RADIUS_THRESHOLD = 0.1  # Minimum radius to consider
     MAX_RADIUS_THRESHOLD = 0.9  # Maximum radius to consider
-    OTF_SLOPE_THRESHOLD = -0.1  # Minimum acceptable OTF decay slope
+    # OTF slope threshold: In log-log space, real camera optics typically show
+    # slopes of -1.0 to -2.0 (steep decay). Shallow slopes (> -0.5) indicate
+    # non-physical frequency response, often from AI upsampling or artificial enhancement.
+    # Threshold of -0.5 provides conservative detection while allowing some margin
+    # for natural variation. Original threshold of -0.1 was too permissive.
+    OTF_SLOPE_THRESHOLD = -0.5  # Minimum acceptable OTF decay slope (refined from -0.1)
     BUMP_RATIO_THRESHOLD = 0.1  # Maximum acceptable bump ratio (10%)
     SUPPRESSION_RATIO_THRESHOLD = 0.15  # Maximum acceptable suppression ratio (15%)
     RESIDUAL_STD_THRESHOLD = 0.5  # High variance threshold for non-smooth decay
@@ -239,8 +244,24 @@ class FrequencyDomainOpticsTest:
         score = 1.0
 
         if slope > self.OTF_SLOPE_THRESHOLD:
-            violations.append("Non-monotonic OTF decay (slope too shallow)")
-            score *= 0.5
+            # Slope is too shallow (less negative than threshold)
+            # Real cameras: typically -1.0 to -2.0, so slopes > -0.5 are suspicious
+            violations.append(
+                f"Non-monotonic OTF decay (slope: {slope:.3f} > {self.OTF_SLOPE_THRESHOLD}) - "
+                f"shallow decay suggests non-physical frequency response (AI upsampling or artificial enhancement)"
+            )
+            # Progressive penalty: more shallow = more suspicious
+            # Slope of -0.5 (at threshold) gets 0.5 penalty
+            # Slope of 0.0 (flat) gets 0.1 penalty
+            # Slope > 0.0 (positive, non-monotonic) gets 0.05 penalty
+            if slope > 0.0:
+                score *= 0.05  # Positive slope (non-monotonic) - very suspicious
+            elif slope > -0.2:
+                score *= 0.1   # Very shallow negative slope
+            elif slope > -0.35:
+                score *= 0.3   # Shallow slope
+            else:
+                score *= 0.5   # At threshold, moderate penalty
 
         if bump_ratio > self.BUMP_RATIO_THRESHOLD:
             violations.append(f"Mid-frequency bumps detected ({bump_ratio:.1%})")
@@ -369,13 +390,15 @@ class FrequencyDomainOpticsTest:
         h, w = log_magnitude.shape
         center_y, center_x = get_center_coords((h, w))
         
-        # Divide image into 4 quadrants + center region
+        # OPTIMIZED: Extract quadrant spectra from full FFT instead of recomputing
+        # The log_magnitude is already computed from the full FFT, so we can extract
+        # quadrants directly without recomputing FFTs
         quad_size_y = h // 3
         quad_size_x = w // 3
         
         quadrant_spectra = []
         
-        # Extract radial power spectrum for each quadrant
+        # Extract radial power spectrum for each quadrant (no FFT recomputation)
         for qy in range(3):
             for qx in range(3):
                 y_start = qy * quad_size_y
@@ -383,7 +406,8 @@ class FrequencyDomainOpticsTest:
                 x_start = qx * quad_size_x
                 x_end = min((qx + 1) * quad_size_x, w)
                 
-                # Extract quadrant spectrum
+                # Extract quadrant spectrum directly from precomputed log_magnitude
+                # No need to recompute FFT - just extract the spatial region
                 quadrant_spectrum = log_magnitude[y_start:y_end, x_start:x_end]
                 
                 # Compute radial average for this quadrant
@@ -479,6 +503,68 @@ class EdgePSFTest:
 
     edge_threshold: float = Field(default=0.1, gt=0.0)
     min_edge_length: int = Field(default=20, gt=0)
+
+    def _calculate_phase_parity_symmetry(self, lsf_window: np.ndarray) -> Tuple[float, float]:
+        """
+        Method 3: Phase & Parity Symmetry Analysis.
+        
+        Identifies AI-generated "zero-phase" ringing artifacts by decomposing the signal
+        into its Even and Odd components and analyzing spectral phase linearity.
+        
+        Args:
+            lsf_window: LSF signal window (centered on peak, 1D array)
+            
+        Returns:
+            Tuple of (symmetry_ratio, phase_symmetry_index)
+            - symmetry_ratio: Symmetry Power Ratio (SR) - ratio of even component power
+            - phase_symmetry_index: Phase Symmetry Index (PSI) - phase linearity measure
+        """
+        if len(lsf_window) < 4:
+            return 0.0, 0.0
+        
+        # Step 1: Parity Decomposition
+        # Generate the reversed signal
+        lsf_reversed = lsf_window[::-1]
+        
+        # Compute Even component: LSF_even = (LSF + LSF_reversed) / 2
+        lsf_even = (lsf_window + lsf_reversed) / 2.0
+        
+        # Compute Odd component: LSF_odd = (LSF - LSF_reversed) / 2
+        lsf_odd = (lsf_window - lsf_reversed) / 2.0
+        
+        # Calculate Symmetry Power Ratio: SR = Σ(LSF_even²) / (Σ(LSF_even²) + Σ(LSF_odd²))
+        even_power = np.sum(lsf_even ** 2)
+        odd_power = np.sum(lsf_odd ** 2)
+        total_power = even_power + odd_power
+        
+        if total_power > 1e-10:
+            symmetry_ratio = even_power / total_power
+        else:
+            symmetry_ratio = 0.0
+        
+        # Step 2: Spectral Phase Analysis
+        # Perform FFT on the centered LSF window
+        fft_result = np.fft.fft(lsf_window)
+        magnitude = np.abs(fft_result)
+        phase = np.angle(fft_result)
+        
+        # Calculate Phase Symmetry Index (PSI):
+        # PSI = Σ(Magnitude · cos(Phase)) / Σ(Magnitude)
+        # This identifies signals where phase is consistently 0 or π (zero-phase filters)
+        # For zero-phase: cos(0) = 1, cos(π) = -1, so PSI approaches 1.0 for symmetric signals
+        magnitude_cos_phase = magnitude * np.cos(phase)
+        sum_magnitude_cos_phase = np.sum(magnitude_cos_phase)
+        sum_magnitude = np.sum(magnitude)
+        
+        if sum_magnitude > 1e-10:
+            phase_symmetry_index = sum_magnitude_cos_phase / sum_magnitude
+            # Normalize to [0, 1] range (cos ranges from -1 to 1, but we want 0 to 1)
+            # Shift and scale: (PSI + 1) / 2 maps [-1, 1] to [0, 1]
+            phase_symmetry_index = (phase_symmetry_index + 1.0) / 2.0
+        else:
+            phase_symmetry_index = 0.0
+        
+        return float(symmetry_ratio), float(phase_symmetry_index)
 
     def _compute_lsf(self, esf: np.ndarray, normalize: bool = True) -> np.ndarray:
         """
@@ -719,12 +805,22 @@ class EdgePSFTest:
             )
             score *= max(0.3, 1.0 - (avg_ringing - 0.2) * 2)
 
-        # REPLACED: Negative lobes threshold → Asymmetry metric
+        # REPLACED: Negative lobes threshold → Normalized Cross-Correlation (NCC) metric
         # Real sharpening halos (ISP) are often one-sided (asymmetric)
         # Diffusion ringing (AI) tends to be more even-symmetric
-        # Measure asymmetry of LSF to distinguish AI (symmetric) from ISP (asymmetric)
+        # Measure symmetry using NCC to distinguish AI (symmetric) from ISP (asymmetric)
+        # NCC formula: R = Σ(L_mirror ⋅ R_crop) / √(Σ L_mirror² ⋅ Σ R_crop²)
+        # R ≈ 1.0: Perfect symmetry (Strong AI signal)
+        # R < 0.7: Significant asymmetry (Likely ISP/Optical)
         asymmetry_scores = []
         symmetric_ringing_asymmetry = []
+        symmetric_ringing_ncc = []  # Store NCC values for symmetric ringing cases
+        
+        # Method 3: Phase & Parity Symmetry Analysis
+        # Identifies AI-generated "zero-phase" ringing artifacts
+        phase_parity_sr_scores = []  # Symmetry Power Ratio (SR)
+        phase_parity_psi_scores = []  # Phase Symmetry Index (PSI)
+        phase_parity_ai_indicators = []  # Combined high-confidence AI indicators
         
         for esf in esf_samples:
             lsf = self._compute_lsf(esf, normalize=True)  # Normalized to peak=1.0
@@ -742,7 +838,7 @@ class EdgePSFTest:
             if len(left_side) == 0 or len(right_side) == 0:
                 continue
             
-            # Mirror one side to compare symmetry
+            # Mirror one side to compare symmetry using Normalized Cross-Correlation (NCC)
             # For even-symmetric (AI diffusion), left and right should be similar
             # For odd-symmetric/asymmetric (ISP sharpening), they differ
             
@@ -754,48 +850,139 @@ class EdgePSFTest:
             left_mirror = left_side[-min_len:][::-1]  # Reverse left side (mirror it)
             right_crop = right_side[:min_len]
             
-            # Compute asymmetry: difference between mirrored left and right
-            # For symmetric ringing: left_mirror ≈ right_crop → low asymmetry
-            # For asymmetric halos: left_mirror ≠ right_crop → high asymmetry
-            asymmetry = np.mean(np.abs(left_mirror - right_crop))
+            # Compute Normalized Cross-Correlation (NCC) between mirrored left and right
+            # NCC formula: R = Σ(L_mirror ⋅ R_crop) / √(Σ L_mirror² ⋅ Σ R_crop²)
+            # R ≈ 1.0: Perfect symmetry (Strong AI signal)
+            # R < 0.7: Significant asymmetry (Likely ISP/Optical)
             
-            # Normalize by average magnitude to get relative asymmetry
-            avg_magnitude = (np.mean(np.abs(left_mirror)) + np.mean(np.abs(right_crop))) / 2.0
-            if avg_magnitude > 1e-6:
-                relative_asymmetry = asymmetry / avg_magnitude
-                asymmetry_scores.append(relative_asymmetry)
+            # Compute numerator: dot product
+            numerator = np.sum(left_mirror * right_crop)
+            
+            # Compute denominator: sqrt of product of sums of squares
+            left_squared_sum = np.sum(left_mirror ** 2)
+            right_squared_sum = np.sum(right_crop ** 2)
+            denominator = np.sqrt(left_squared_sum * right_squared_sum)
+            
+            # Compute NCC coefficient
+            if denominator > 1e-10:  # Avoid division by zero
+                ncc_coefficient = numerator / denominator
+                # Clamp to [-1, 1] range (theoretical bounds for correlation)
+                ncc_coefficient = max(-1.0, min(1.0, ncc_coefficient))
+            else:
+                # If denominator is too small, assume no correlation
+                ncc_coefficient = 0.0
+            
+            # Convert NCC to asymmetry metric for consistency with existing code
+            # High NCC (≈1.0) = symmetric = low asymmetry
+            # Low NCC (<0.7) = asymmetric = high asymmetry
+            # Invert: asymmetry = 1.0 - NCC (so high NCC → low asymmetry)
+            relative_asymmetry = 1.0 - ncc_coefficient
+            asymmetry_scores.append(relative_asymmetry)
             
             # Also check if there are negative lobes on both sides (symmetric ringing indicator)
-            # This is a stronger AI signature when combined with low asymmetry
+            # This is a stronger AI signature when combined with high NCC (symmetric)
             has_left_negative = np.any(left_side < -0.05)
             has_right_negative = np.any(right_side < -0.05)
             
             if has_left_negative and has_right_negative:
-                # Both sides have negative lobes - check if symmetric
-                if avg_magnitude > 1e-6:
+                # Both sides have negative lobes - check if symmetric using NCC
+                # High NCC (≥0.7) with negative lobes on both sides = symmetric ringing (AI)
+                if ncc_coefficient >= 0.7:
+                    # Store both the asymmetry (inverted from NCC) and NCC for symmetric ringing detection
                     symmetric_ringing_asymmetry.append(relative_asymmetry)
+                    symmetric_ringing_ncc.append(ncc_coefficient)
+            
+            # Method 3: Phase & Parity Symmetry Analysis
+            # Extract LSF window centered on peak for phase/parity analysis
+            # Use a window around the peak (extend equally on both sides)
+            window_radius = min(peak_idx, len(lsf) - peak_idx - 1, 20)  # Limit window size
+            if window_radius >= 2:
+                window_start = max(0, peak_idx - window_radius)
+                window_end = min(len(lsf), peak_idx + window_radius + 1)
+                lsf_window = lsf[window_start:window_end]
+                
+                # Center the window on peak (shift peak to center)
+                peak_in_window = peak_idx - window_start
+                # Create centered window: equal samples on both sides of peak
+                min_side = min(peak_in_window, len(lsf_window) - peak_in_window - 1)
+                if min_side >= 2:
+                    centered_window = lsf_window[peak_in_window - min_side:peak_in_window + min_side + 1]
+                    
+                    # Calculate phase and parity symmetry
+                    sr, psi = self._calculate_phase_parity_symmetry(centered_window)
+                    phase_parity_sr_scores.append(sr)
+                    phase_parity_psi_scores.append(psi)
+                    
+                    # High-confidence AI indicator: SR > 0.85 AND PSI > 0.85 AND negative lobes
+                    # This identifies zero-phase symmetric ringing (strong AI signature)
+                    if sr > 0.85 and psi > 0.85 and has_left_negative and has_right_negative:
+                        phase_parity_ai_indicators.append(True)
+                    else:
+                        phase_parity_ai_indicators.append(False)
 
         avg_asymmetry = np.mean(asymmetry_scores) if asymmetry_scores else 0.0
         avg_symmetric_ringing_asymmetry = (
             np.mean(symmetric_ringing_asymmetry) if symmetric_ringing_asymmetry else 1.0
         )
         
-        # Forensic logic:
-        # - Low asymmetry (< 0.3) with negative lobes on both sides → AI diffusion ringing (symmetric)
-        # - High asymmetry (> 0.5) → Real ISP sharpening (one-sided halos, less suspicious)
-        # - Medium asymmetry (0.3-0.5) → Ambiguous, less penalty
+        # Forensic logic using NCC:
+        # - High NCC (≥0.7) with negative lobes on both sides → AI diffusion ringing (symmetric)
+        # - Low NCC (<0.7) → Real ISP sharpening (asymmetric, less suspicious)
+        # - NCC 0.7-0.85 → Moderate symmetry (ambiguous, less penalty)
+        #
+        # Note: relative_asymmetry = 1.0 - NCC, so:
+        # - High NCC (0.7-1.0) → Low asymmetry (0.0-0.3) → AI (symmetric)
+        # - Low NCC (<0.7) → High asymmetry (>0.3) → ISP (asymmetric)
         
-        # Penalize symmetric ringing (low asymmetry + negative lobes on both sides)
+        # Penalize symmetric ringing (high NCC ≥0.7 + negative lobes on both sides)
+        # avg_symmetric_ringing_asymmetry is 1.0 - NCC, so <0.3 means NCC >0.7
         if len(symmetric_ringing_asymmetry) > 0 and avg_symmetric_ringing_asymmetry < 0.3:
             symmetric_count = len(symmetric_ringing_asymmetry)
             symmetric_ratio = symmetric_count / len(esf_samples) if esf_samples else 0.0
             
+            # Calculate average NCC for symmetric ringing cases (stored directly)
+            avg_symmetric_ncc = np.mean(symmetric_ringing_ncc) if symmetric_ringing_ncc else 0.7
+            
             violations.append(
-                f"Even-symmetric ringing detected (asymmetry: {avg_symmetric_ringing_asymmetry:.3f}, "
+                f"Even-symmetric ringing detected (NCC: {avg_symmetric_ncc:.3f}, "
                 f"{symmetric_ratio:.1%} of edges) - suggests AI diffusion artifacts"
             )
             # Strong penalty for symmetric ringing (AI indicator)
-            score *= max(0.2, avg_symmetric_ringing_asymmetry * 2)
+            # Penalty scales with NCC: higher NCC (more symmetric) = stronger penalty
+            # NCC 0.7 → penalty factor 0.44, NCC 1.0 → penalty factor 0.2
+            penalty_factor = max(0.2, 1.0 - avg_symmetric_ncc * 0.8)
+            score *= penalty_factor
+        
+        # Method 3: Phase & Parity Symmetry - High-confidence AI detection
+        # If SR > 0.85 AND PSI > 0.85 AND negative lobes, apply strong penalty
+        # This catches zero-phase symmetric ringing even if Method 1/2 are borderline
+        avg_sr = np.mean(phase_parity_sr_scores) if phase_parity_sr_scores else 0.0
+        avg_psi = np.mean(phase_parity_psi_scores) if phase_parity_psi_scores else 0.0
+        phase_parity_ai_count = sum(phase_parity_ai_indicators) if phase_parity_ai_indicators else 0
+        phase_parity_ai_ratio = phase_parity_ai_count / len(esf_samples) if esf_samples else 0.0
+        
+        # Log phase/parity metrics for debugging
+        if phase_parity_sr_scores:
+            logger.debug(
+                f"Phase & Parity Analysis: avg_SR={avg_sr:.3f}, avg_PSI={avg_psi:.3f}, "
+                f"AI_indicators={phase_parity_ai_count}/{len(esf_samples)} ({phase_parity_ai_ratio:.1%})"
+            )
+        
+        if phase_parity_ai_count > 0:
+            # High-confidence AI indicator: zero-phase symmetric ringing
+            violations.append(
+                f"Zero-phase symmetric ringing detected (SR: {avg_sr:.3f}, PSI: {avg_psi:.3f}, "
+                f"{phase_parity_ai_ratio:.1%} of edges) - strong AI diffusion artifact indicator"
+            )
+            # Very strong penalty for zero-phase symmetric ringing (physical optics rarely produce this)
+            # Combined metric: (SR + PSI) / 2, penalize more when both are high
+            combined_metric = (avg_sr + avg_psi) / 2.0
+            penalty_factor = max(0.15, 1.0 - combined_metric * 0.85)  # Stronger penalty than NCC alone
+            score *= penalty_factor
+            logger.debug(
+                f"Applied zero-phase ringing penalty: combined_metric={combined_metric:.3f}, "
+                f"penalty_factor={penalty_factor:.3f}"
+            )
         
         # Note: High asymmetry (> 0.5) is actually less suspicious (real ISP sharpening)
         # We don't penalize high asymmetry, as it's consistent with real camera processing
@@ -845,6 +1032,13 @@ class EdgePSFTest:
                 "example_lsf": example_lsf,
                 "ringing_scores": ringing_scores,
                 "psf_widths": psf_widths,
+                # Method 2: NCC metrics
+                "avg_ncc": 1.0 - avg_asymmetry if asymmetry_scores else 0.0,  # Convert back to NCC
+                "avg_symmetric_ncc": np.mean(symmetric_ringing_ncc) if symmetric_ringing_ncc else 0.0,
+                # Method 3: Phase & Parity metrics
+                "avg_symmetry_ratio": avg_sr if phase_parity_sr_scores else 0.0,
+                "avg_phase_symmetry_index": avg_psi if phase_parity_psi_scores else 0.0,
+                "phase_parity_ai_ratio": phase_parity_ai_ratio,
             },
         )
 
@@ -1014,8 +1208,8 @@ class DepthOfFieldConsistencyTest:
         sample_blur = valid_blur[sample_indices]
         sample_coords = valid_coords[sample_indices]
 
-        # OPTIMIZED: Precompute all pairwise distances and blur differences
-        # This reduces redundant calculations from O(n³) to O(n²) preprocessing + O(n³) checking
+        # OPTIMIZED: Vectorized triplet checking using broadcasting
+        # This reduces O(n³) nested loops to vectorized operations
         n_samples = len(sample_coords)
         
         # Precompute pairwise distances (symmetric matrix)
@@ -1030,45 +1224,69 @@ class DepthOfFieldConsistencyTest:
         blur_array = np.array(sample_blur)
         blur_diffs = np.abs(blur_array[:, None] - blur_array[None, :])  # (n, n)
         
-        # Now check triplets more efficiently
-        impossible_patterns = 0
+        # VECTORIZED: Check triplets using broadcasting
+        # Optimized to vectorize inner loops while maintaining early termination
         max_possible_triplets = n_samples * (n_samples - 1) * (n_samples - 2) // 6
-        threshold_ratio = max_possible_triplets * self.DOF_VIOLATION_RATIO_THRESHOLD  # Early termination threshold
+        threshold_ratio = max_possible_triplets * self.DOF_VIOLATION_RATIO_THRESHOLD
         
+        impossible_patterns = 0
+        
+        # Vectorized approach: check triplets in batches
+        # For efficiency, we'll still use early termination but vectorize the inner checks
+        max_dist = np.max(distances)
+        dist_threshold = max_dist * 0.5
+        
+        # Iterate over i, but vectorize j and k checks
         for i in range(n_samples - 2):
-            for j in range(i + 1, n_samples - 1):
-                dist_ij = distances[i, j]
-                blur_diff_ij = blur_diffs[i, j]
+            # Get all j > i
+            j_candidates = np.arange(i + 1, n_samples - 1)
+            
+            # Filter j candidates: only check if dist_ij is reasonable (vectorized)
+            dist_ij_vec = distances[i, j_candidates]
+            valid_j_mask = dist_ij_vec <= dist_threshold
+            j_valid = j_candidates[valid_j_mask]
+            
+            if len(j_valid) == 0:
+                continue
+            
+            # For each valid j, vectorize k checks
+            for j_idx, j in enumerate(j_valid):
+                k_candidates = np.arange(j + 1, n_samples)
                 
-                # Only check k if i and j are reasonably close (optimization)
-                # Skip if i and j are very far apart (unlikely to form impossible pattern)
-                if dist_ij > np.max(distances) * 0.5:
+                if len(k_candidates) == 0:
                     continue
                 
-                for k in range(j + 1, n_samples):
-                    # Use precomputed values
-                    dist_ik = distances[i, k]
-                    dist_jk = distances[j, k]
-                    
-                    # Early check: only proceed if i and k are close
-                    if not (dist_ik < dist_ij and dist_ik < dist_jk):
-                        continue
-                    
-                    # Use precomputed blur differences
-                    blur_diff_ik = blur_diffs[i, k]
-                    blur_diff_jk = blur_diffs[j, k]
-                    
-                    # Check for impossible pattern
-                    if (
-                        blur_diff_ik > max(blur_diff_ij, blur_diff_jk) * 1.5
-                        and min(blur_diff_ij, blur_diff_jk) < blur_diff_ik * 0.5
-                    ):
-                        impossible_patterns += 1
-                        
-                        # Early termination if we've found enough violations
-                        if impossible_patterns > threshold_ratio:
-                            break
+                # Vectorized check for all k candidates
+                dist_ik_vec = distances[i, k_candidates]
+                dist_jk_vec = distances[j, k_candidates]
+                dist_ij = dist_ij_vec[valid_j_mask][j_idx]  # Get dist_ij for this j
                 
+                # Early check: only proceed if i and k are close (vectorized)
+                close_mask = (dist_ik_vec < dist_ij) & (dist_ik_vec < dist_jk_vec)
+                k_valid = k_candidates[close_mask]
+                
+                if len(k_valid) == 0:
+                    continue
+                
+                # Vectorized blur difference checks for all valid k
+                blur_diff_ij = blur_diffs[i, j]
+                blur_diff_ik_vec = blur_diffs[i, k_valid]
+                blur_diff_jk_vec = blur_diffs[j, k_valid]
+                
+                # Vectorized impossible pattern check
+                # Condition: blur_diff_ik > max(blur_diff_ij, blur_diff_jk) * 1.5
+                # AND min(blur_diff_ij, blur_diff_jk) < blur_diff_ik * 0.5
+                max_blur_ij_jk = np.maximum(blur_diff_ij, blur_diff_jk_vec)
+                min_blur_ij_jk = np.minimum(blur_diff_ij, blur_diff_jk_vec)
+                
+                violation_mask = (
+                    (blur_diff_ik_vec > max_blur_ij_jk * 1.5) &
+                    (min_blur_ij_jk < blur_diff_ik_vec * 0.5)
+                )
+                
+                impossible_patterns += np.sum(violation_mask)
+                
+                # Early termination if we've found enough violations
                 if impossible_patterns > threshold_ratio:
                     break
             
@@ -1103,25 +1321,30 @@ class DepthOfFieldConsistencyTest:
         h, w = image.shape
         
         # Method 1: Check for textured background
-        # Compute local variance in windows to detect texture
+        # OPTIMIZED: Use vectorized sliding window variance computation
+        # Variance = E[X²] - E[X]², computed using convolution
         window_size = 15
         half_window = window_size // 2
-        texture_map = np.zeros((h, w))
+        from scipy.ndimage import gaussian_filter
         
-        for y in range(half_window, h - half_window, 5):  # Sample every 5 pixels
-            for x in range(half_window, w - half_window, 5):
-                patch = image[y - half_window:y + half_window + 1, 
-                             x - half_window:x + half_window + 1]
-                if patch.size > 0:
-                    texture_map[y, x] = np.var(patch)
+        # Compute local mean and mean of squares using Gaussian filter (approximates box filter)
+        local_mean = gaussian_filter(image, sigma=half_window)
+        local_mean_sq = gaussian_filter(image**2, sigma=half_window)
+        texture_map = local_mean_sq - local_mean**2  # Variance = E[X²] - E[X]²
+        
+        # Sample every 5 pixels for efficiency (texture_map is already computed for all pixels)
+        # We'll use the full texture_map but sample for threshold comparison
         
         # Method 2: Check for defocus gradients
+        # OPTIMIZED: Cache gradient computation for potential reuse
         # Compute gradient magnitude to detect spatial variation
+        # Note: This gradient could be cached if used in other tests on the same image
         gy, gx = np.gradient(image)
         gradient_mag = np.sqrt(gx**2 + gy**2)
         
         # Defocus gradients: high spatial variation in gradient magnitude
         # (blurry regions have lower gradients, sharp regions have higher)
+        # Compute second-order gradient (gradient of gradient magnitude)
         gy_grad, gx_grad = np.gradient(gradient_mag)
         defocus_gradient_mag = np.sqrt(gy_grad**2 + gx_grad**2)
         
@@ -1215,6 +1438,9 @@ class DepthOfFieldConsistencyTest:
         if frequency_ratio > 2.0:
             blur_radius = 0.5  # Very sharp
         elif frequency_ratio > 1.0:
+            # Map frequency_ratio from (1.0, 2.0] to blur_radius [2.0, 1.0]
+            # When ratio = 2.0: blur = 1.0 + (2.0 - 2.0) * 1.0 = 1.0
+            # When ratio = 1.0: blur = 1.0 + (2.0 - 1.0) * 1.0 = 2.0
             blur_radius = 1.0 + (2.0 - frequency_ratio) * 1.0  # Sharp to medium
         elif frequency_ratio > 0.5:
             blur_radius = 3.0 + (1.0 - frequency_ratio) * 4.0  # Medium to blurry
@@ -1255,6 +1481,43 @@ class DepthOfFieldConsistencyTest:
         # SOFT SCORING: Use evidence_ratio to weight the test
         # evidence_ratio ranges from 0.0 (no evidence) to 1.0 (strong evidence)
         
+        # Always compute blur map for diagnostics, even with low evidence
+        # This provides useful visualization even when test is soft-scored
+        h, w = image.shape
+        
+        # Sample points on a grid
+        grid_spacing = max(10, min(h, w) // 20)
+        y_coords = np.arange(0, h, grid_spacing)
+        x_coords = np.arange(0, w, grid_spacing)
+        total_grid_points = len(y_coords) * len(x_coords)
+        logger.debug(f"DOF test: Sampling {len(y_coords)}x{len(x_coords)}={total_grid_points} grid points")
+
+        blur_map = np.zeros((len(y_coords), len(x_coords)))
+        blur_map[:] = np.nan  # Initialize with NaN
+
+        # Estimate blur at all grid points using frequency attenuation
+        logger.debug("  Estimating blur using frequency attenuation (Laplacian/Gradient energy ratio)...")
+        
+        processed_count = 0
+        for i, y in enumerate(y_coords):
+            if i % 5 == 0 and i > 0:
+                logger.debug(f"  Processing row {i}/{len(y_coords)} ({processed_count} blur estimates so far)...")
+            for j, x in enumerate(x_coords):
+                y_int = int(y)
+                x_int = int(x)
+                
+                # Estimate blur using frequency attenuation (works on any patch)
+                blur_est = self.estimate_local_blur(image, y_int, x_int)
+                if not np.isnan(blur_est):
+                    blur_map[i, j] = blur_est
+                    processed_count += 1
+        
+        logger.debug(
+            f"  ✓ Blur map computed: {processed_count}/{total_grid_points} valid estimates. "
+            f"Blur range: [{np.nanmin(blur_map):.3f}, {np.nanmax(blur_map):.3f}], "
+            f"unique values: {len(np.unique(blur_map[~np.isnan(blur_map)])) if processed_count > 0 else 0}"
+        )
+
         if not has_evidence:
             # Low evidence: Give partial credit based on evidence ratio
             # This prevents false positives while still acknowledging limited evidence
@@ -1285,43 +1548,17 @@ class DepthOfFieldConsistencyTest:
                     "soft_scoring": True,
                     "evidence_ratio": evidence_ratio,
                     "evidence_weight": evidence_weight,
-                    "reason": "low_blur_evidence_soft_scoring"
+                    "reason": "low_blur_evidence_soft_scoring",
+                    "blur_map": blur_map,  # Include blur map for diagnostics
+                    "y_coords": y_coords,
+                    "x_coords": x_coords,
                 },
             )
 
         logger.debug(f"Blur evidence detected (ratio: {evidence_ratio:.3f}) - proceeding with DOF test (soft scoring)")
 
-        h, w = image.shape
-
-        # Sample points on a grid
-        grid_spacing = max(10, min(h, w) // 20)
-        y_coords = np.arange(0, h, grid_spacing)
-        x_coords = np.arange(0, w, grid_spacing)
-        total_grid_points = len(y_coords) * len(x_coords)
-        logger.debug(f"DOF test: Sampling {len(y_coords)}x{len(x_coords)}={total_grid_points} grid points")
-
-        blur_map = np.zeros((len(y_coords), len(x_coords)))
-        blur_map[:] = np.nan  # Initialize with NaN
-
-        # NEW METHOD: Frequency attenuation works on any patch (no edge requirement)
-        # Estimate blur at all grid points using frequency attenuation
-        logger.debug("  Estimating blur using frequency attenuation (Laplacian/Gradient energy ratio)...")
-        
-        processed_count = 0
-        for i, y in enumerate(y_coords):
-            if i % 5 == 0 and i > 0:
-                logger.debug(f"  Processing row {i}/{len(y_coords)} ({processed_count} blur estimates so far)...")
-            for j, x in enumerate(x_coords):
-                y_int = int(y)
-                x_int = int(x)
-                
-                # Estimate blur using frequency attenuation (works on any patch)
-                blur_est = self.estimate_local_blur(image, y_int, x_int)
-                if not np.isnan(blur_est):
-                    blur_map[i, j] = blur_est
-                    processed_count += 1
-        
-        logger.debug(f"  ✓ Blur map computed: {processed_count}/{total_grid_points} valid estimates")
+        # Blur map already computed above (before the has_evidence check)
+        # Continue with DOF analysis using the computed blur_map
 
         # Filter out NaN values for analysis
         valid_blur = blur_map[~np.isnan(blur_map)]
@@ -1418,34 +1655,44 @@ class DepthOfFieldConsistencyTest:
             score *= max(0.3, blur_unique_ratio * 2)
 
         # Test 2: Local entropy of blur map
+        # OPTIMIZED: Use vectorized operations instead of nested loops
         # Real blur: High entropy (subtle variations across space)
         # AI blur: Low entropy (uniform regions with identical values)
         from scipy.stats import entropy as scipy_entropy
+        from scipy.ndimage import generic_filter
 
-        # Compute local entropy using sliding window
-        # High entropy = varied blur (natural), low entropy = uniform blur (AI)
-        local_entropy_values = []
-        window_size = 3  # 3×3 window for local entropy
+        # OPTIMIZED: Use generic_filter for vectorized local entropy computation
+        # This is much faster than nested loops
+        def compute_window_entropy(window_flat):
+            """Compute entropy of a 3×3 window (flattened)."""
+            window_flat = window_flat[~np.isnan(window_flat)]
+            if len(window_flat) < 3:
+                return np.nan
+            
+            # Compute histogram entropy
+            hist, _ = np.histogram(
+                window_flat, bins=min(10, len(window_flat)), density=True
+            )
+            hist = hist[hist > 0]  # Remove zeros
+            if len(hist) > 0:
+                return scipy_entropy(hist)
+            return np.nan
 
-        for i in range(1, blur_map.shape[0] - 1):
-            for j in range(1, blur_map.shape[1] - 1):
-                if valid_mask[i, j]:
-                    # Extract local window
-                    window = blur_map[
-                        max(0, i - 1) : min(blur_map.shape[0], i + 2),
-                        max(0, j - 1) : min(blur_map.shape[1], j + 2),
-                    ]
-                    window_valid = window[~np.isnan(window)]
-
-                    if len(window_valid) >= 3:
-                        # Compute histogram entropy
-                        hist, _ = np.histogram(
-                            window_valid, bins=min(10, len(window_valid)), density=True
-                        )
-                        hist = hist[hist > 0]  # Remove zeros
-                        if len(hist) > 0:
-                            local_ent = scipy_entropy(hist)
-                            local_entropy_values.append(local_ent)
+        # Compute local entropy using vectorized filter
+        # Only compute for valid pixels (where valid_mask is True)
+        logger.debug("  Computing local entropy (vectorized)...")
+        local_entropy_map = generic_filter(
+            blur_map,
+            compute_window_entropy,
+            size=3,
+            mode='constant',
+            cval=np.nan
+        )
+        
+        # Extract entropy values only for valid pixels
+        local_entropy_values = local_entropy_map[valid_mask]
+        local_entropy_values = local_entropy_values[~np.isnan(local_entropy_values)]
+        logger.debug(f"  ✓ Local entropy computed for {len(local_entropy_values)} valid pixels")
 
         if len(local_entropy_values) > 5:
             mean_local_entropy = np.mean(local_entropy_values)
@@ -2557,9 +2804,43 @@ class OpticsConsistencyDetector:
     dof_weight: float = Field(default=0.2, ge=0.0, le=1.0)
     ca_weight: float = Field(default=0.15, ge=0.0, le=1.0)
     noise_residual_weight: float = Field(default=0.2, ge=0.0, le=1.0)
+    
+    # Gradient cache to avoid recomputing gradients on the same image
+    _gradient_cache: dict = Field(default_factory=dict, repr=False)
+
+    def _get_cached_gradient(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Get cached gradient or compute and cache it.
+        
+        Args:
+            image: Grayscale image (H, W), float32 [0, 1]
+            
+        Returns:
+            Tuple of (gy, gx) gradient arrays
+        """
+        # Create a simple hash of the image for caching
+        # Use image shape and a sample of pixel values as key
+        image_hash = hash((image.shape, image.dtype, tuple(image.flat[:100])))
+        
+        if image_hash in self._gradient_cache:
+            logger.debug("  Using cached gradient")
+            return self._gradient_cache[image_hash]
+        
+        # Compute gradient
+        logger.debug("  Computing gradient (caching for reuse)")
+        gy, gx = np.gradient(image)
+        self._gradient_cache[image_hash] = (gy, gx)
+        
+        # Limit cache size to prevent memory issues
+        if len(self._gradient_cache) > 10:
+            # Remove oldest entry (simple FIFO)
+            oldest_key = next(iter(self._gradient_cache))
+            del self._gradient_cache[oldest_key]
+        
+        return gy, gx
 
     def __post_init__(self):
-        """Initialize test components."""
+        """Initialize test components and normalize weights."""
         self.frequency_test = FrequencyDomainOpticsTest()
         self.edge_psf_test = EdgePSFTest()
         self.dof_test = DepthOfFieldConsistencyTest()

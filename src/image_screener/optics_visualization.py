@@ -149,7 +149,10 @@ def create_optics_diagnostics_plot(
     dof_data = result.dof_consistency_test.diagnostic_data
     if "blur_map" in dof_data:
         blur_map = dof_data["blur_map"]
-        im = ax3.imshow(blur_map, cmap="hot", aspect="auto", interpolation="bilinear")
+        # Handle NaN values: mask them for visualization
+        # This prevents matplotlib from normalizing incorrectly when most values are NaN
+        blur_map_vis = np.ma.masked_invalid(blur_map)
+        im = ax3.imshow(blur_map_vis, cmap="hot", aspect="auto", interpolation="bilinear")
         ax3.set_title(
             f"DOF Consistency Test\nScore: {result.dof_consistency_test.score:.3f}",
             fontweight="bold",
