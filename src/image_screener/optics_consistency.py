@@ -6,11 +6,13 @@ optical laws expected from real cameras:
 2. Blur occurs before detail and noise injection
 3. Depth-of-field blur varies continuously with depth
 4. Chromatic aberration is small but non-zero and spatially coherent
+
+REFACTORED: Types are now imported from optics_tests.types module.
 """
 
 import logging
 import time
-from typing import List, NamedTuple, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -21,6 +23,10 @@ from scipy.interpolate import interp1d
 
 from image_screener.dft import DFTProcessor, get_center_coords
 from image_screener.preprocessing import ImagePreprocessor
+from image_screener.optics_tests.types import (
+    OpticsTestResult,
+    OpticsConsistencyResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,25 +41,9 @@ __all__ = [
     'SensorNoiseResidualTest',
 ]
 
-
-class OpticsTestResult(NamedTuple):
-    """Result from a single optics test."""
-
-    score: float  # 0.0 (fails) to 1.0 (passes)
-    violations: List[str]  # List of detected violations
-    diagnostic_data: dict  # Additional data for visualization
-
-
-class OpticsConsistencyResult(NamedTuple):
-    """Complete optics consistency analysis result."""
-
-    optics_score: float  # Overall score (0.0-1.0)
-    frequency_test: OpticsTestResult
-    edge_psf_test: OpticsTestResult
-    dof_consistency_test: OpticsTestResult
-    chromatic_aberration_test: OpticsTestResult
-    noise_residual_test: OpticsTestResult  # Sensor noise residual test
-    explanation: str  # Human-readable explanation
+# ============================================================================
+# TEST 1: FREQUENCY DOMAIN OPTICS TEST
+# ============================================================================
 
 
 @pydantic_dataclass
@@ -492,6 +482,12 @@ class FrequencyDomainOpticsTest:
         )
 
 
+# ============================================================================
+# TEST 2: EDGE SPREAD FUNCTION / POINT SPREAD FUNCTION TEST
+# ============================================================================
+# Detects strong edges, extracts Edge Spread Functions (ESF),
+# differentiates to get Line Spread Function (LSF), and flags
+# ringing, negative lobes, or inconsistent PSF width.
 @pydantic_dataclass
 class EdgePSFTest:
     """Test 2: Edge Spread Function / Point Spread Function test.
@@ -504,7 +500,7 @@ class EdgePSFTest:
     edge_threshold: float = Field(default=0.1, gt=0.0)
     min_edge_length: int = Field(default=20, gt=0)
 
-    def _calculate_phase_parity_symmetry(self, lsf_window: np.ndarray) -> Tuple[float, float]:
+    def _calculate_phase_parity_symmetry(self, lsf_window: np.ndarray) -> Tuple[float, float, float]:
         """
         Method 3: Phase & Parity Symmetry Analysis.
         
@@ -515,12 +511,13 @@ class EdgePSFTest:
             lsf_window: LSF signal window (centered on peak, 1D array)
             
         Returns:
-            Tuple of (symmetry_ratio, phase_symmetry_index)
+            Tuple of (symmetry_ratio, phase_symmetry_index, phase_variance)
             - symmetry_ratio: Symmetry Power Ratio (SR) - ratio of even component power
             - phase_symmetry_index: Phase Symmetry Index (PSI) - phase linearity measure
+            - phase_variance: Variance of phase across mid-to-high frequencies (for AI detection)
         """
         if len(lsf_window) < 4:
-            return 0.0, 0.0
+            return 0.0, 0.0, 1.0  # High phase variance for short signals
         
         # Step 1: Parity Decomposition
         # Generate the reversed signal
@@ -564,7 +561,35 @@ class EdgePSFTest:
         else:
             phase_symmetry_index = 0.0
         
-        return float(symmetry_ratio), float(phase_symmetry_index)
+        # Step 3: Calculate Phase Variance across mid-to-high frequencies
+        # True AI: Low phase variance (near zero phase) across all mid-to-high frequencies
+        # Professional Sharpening: Higher phase variance in high frequencies due to sensor noise interference
+        # Focus on mid-to-high frequencies (skip DC and very low frequencies)
+        n_freqs = len(phase)
+        mid_high_start = max(1, n_freqs // 4)  # Start from 25% of frequencies
+        mid_high_end = n_freqs // 2  # Up to Nyquist (half of frequencies)
+        
+        if mid_high_end > mid_high_start:
+            mid_high_phases = phase[mid_high_start:mid_high_end]
+            mid_high_magnitudes = magnitude[mid_high_start:mid_high_end]
+            
+            # Weight phase variance by magnitude (more weight to significant frequencies)
+            if np.sum(mid_high_magnitudes) > 1e-10:
+                # Normalize magnitudes for weighting
+                weights = mid_high_magnitudes / np.sum(mid_high_magnitudes)
+                # Calculate weighted phase variance
+                # For zero-phase signals, phases should be near 0 or π, so variance should be low
+                # For signals with noise, phases will be more random, variance will be higher
+                weighted_mean_phase = np.sum(weights * mid_high_phases)
+                phase_variance = np.sum(weights * (mid_high_phases - weighted_mean_phase) ** 2)
+                # Normalize by π² to get variance in [0, 1] range (phases are in [-π, π])
+                phase_variance = phase_variance / (np.pi ** 2)
+            else:
+                phase_variance = 1.0  # High variance if no significant frequencies
+        else:
+            phase_variance = 1.0  # High variance if insufficient frequencies
+        
+        return float(symmetry_ratio), float(phase_symmetry_index), float(phase_variance)
 
     def _compute_lsf(self, esf: np.ndarray, normalize: bool = True) -> np.ndarray:
         """
@@ -618,17 +643,67 @@ class EdgePSFTest:
 
         return lsf_padded
 
-    def test(self, image: np.ndarray) -> OpticsTestResult:
+    def _estimate_high_frequency_energy(self, image: np.ndarray) -> float:
+        """
+        Estimate high-frequency energy in the image.
+        
+        Used to adjust NCC threshold dynamically:
+        - High high-frequency energy → require higher NCC (>0.9) for AI flag
+        - Low high-frequency energy → lower NCC threshold acceptable
+        
+        Args:
+            image: Grayscale image (H, W), float32 [0, 1]
+            
+        Returns:
+            High-frequency energy estimate (0.0-1.0)
+        """
+        # Compute 2D FFT to estimate high-frequency content
+        dft_processor = DFTProcessor()
+        fft_result = dft_processor.compute_dft(image)
+        fft_shifted = dft_processor.shift_spectrum(fft_result)
+        magnitude = np.abs(fft_shifted)
+        
+        h, w = magnitude.shape
+        center_y, center_x = get_center_coords((h, w))
+        
+        # Create mask for high-frequency region
+        y_coords, x_coords = np.ogrid[:h, :w]
+        distances = np.sqrt((y_coords - center_y) ** 2 + (x_coords - center_x) ** 2)
+        max_distance = np.sqrt(center_y ** 2 + center_x ** 2)
+        normalized_distances = distances / max_distance
+        
+        # High frequencies: outer 30% of spectrum
+        high_freq_mask = normalized_distances > 0.7
+        if np.sum(high_freq_mask) > 0:
+            high_freq_energy = np.mean(magnitude[high_freq_mask])
+            # Normalize by total energy for relative measure
+            total_energy = np.mean(magnitude)
+            if total_energy > 1e-10:
+                return float(high_freq_energy / total_energy)
+        
+        return 0.0
+
+    def test(
+        self, 
+        image: np.ndarray, 
+        ca_is_radial: Optional[bool] = None
+    ) -> OpticsTestResult:
         """
         Test edge spread function consistency.
 
         Args:
             image: Grayscale image (H, W), float32 [0, 1]
+            ca_is_radial: Optional CA test result - if True, CA is radial (reduces AI penalty)
 
         Returns:
             OpticsTestResult with score and violations
         """
         logger.debug("Running edge PSF test")
+        
+        # Estimate high-frequency energy for dynamic NCC threshold
+        # This is used later to adjust NCC threshold (higher energy → require higher NCC)
+        high_freq_energy = self._estimate_high_frequency_energy(image)
+        logger.debug(f"  High-frequency energy: {high_freq_energy:.4f}")
 
         # Convert to uint8 for edge detection
         img_uint8 = (image * 255).astype(np.uint8)
@@ -820,6 +895,7 @@ class EdgePSFTest:
         # Identifies AI-generated "zero-phase" ringing artifacts
         phase_parity_sr_scores = []  # Symmetry Power Ratio (SR)
         phase_parity_psi_scores = []  # Phase Symmetry Index (PSI)
+        phase_parity_phase_variance_scores = []  # Phase variance (for AI detection)
         phase_parity_ai_indicators = []  # Combined high-confidence AI indicators
         
         for esf in esf_samples:
@@ -886,8 +962,12 @@ class EdgePSFTest:
             
             if has_left_negative and has_right_negative:
                 # Both sides have negative lobes - check if symmetric using NCC
-                # High NCC (≥0.7) with negative lobes on both sides = symmetric ringing (AI)
-                if ncc_coefficient >= 0.7:
+                # DYNAMIC NCC THRESHOLD: Require higher NCC (>0.9) for high-confidence AI flag
+                # if image has high high-frequency energy (professional sharpening can have lower NCC)
+                # For images with low high-frequency energy, use lower threshold (0.7)
+                dynamic_ncc_threshold = 0.9 if high_freq_energy > 0.15 else 0.7
+                
+                if ncc_coefficient >= dynamic_ncc_threshold:
                     # Store both the asymmetry (inverted from NCC) and NCC for symmetric ringing detection
                     symmetric_ringing_asymmetry.append(relative_asymmetry)
                     symmetric_ringing_ncc.append(ncc_coefficient)
@@ -908,15 +988,22 @@ class EdgePSFTest:
                 if min_side >= 2:
                     centered_window = lsf_window[peak_in_window - min_side:peak_in_window + min_side + 1]
                     
-                    # Calculate phase and parity symmetry
-                    sr, psi = self._calculate_phase_parity_symmetry(centered_window)
+                    # Calculate phase and parity symmetry (now includes phase variance)
+                    sr, psi, phase_var = self._calculate_phase_parity_symmetry(centered_window)
                     phase_parity_sr_scores.append(sr)
                     phase_parity_psi_scores.append(psi)
+                    phase_parity_phase_variance = phase_var  # Store for later use
                     
                     # High-confidence AI indicator: SR > 0.85 AND PSI > 0.85 AND negative lobes
                     # This identifies zero-phase symmetric ringing (strong AI signature)
+                    # NEW: Also check phase variance - True AI has low phase variance
                     if sr > 0.85 and psi > 0.85 and has_left_negative and has_right_negative:
-                        phase_parity_ai_indicators.append(True)
+                        # Check phase variance: True AI has low variance (near zero phase)
+                        # Professional sharpening has higher variance due to sensor noise
+                        if phase_var < 0.1:  # Low phase variance = AI
+                            phase_parity_ai_indicators.append(True)
+                        else:
+                            phase_parity_ai_indicators.append(False)  # Higher variance = professional sharpening
                     else:
                         phase_parity_ai_indicators.append(False)
 
@@ -934,14 +1021,21 @@ class EdgePSFTest:
         # - High NCC (0.7-1.0) → Low asymmetry (0.0-0.3) → AI (symmetric)
         # - Low NCC (<0.7) → High asymmetry (>0.3) → ISP (asymmetric)
         
-        # Penalize symmetric ringing (high NCC ≥0.7 + negative lobes on both sides)
-        # avg_symmetric_ringing_asymmetry is 1.0 - NCC, so <0.3 means NCC >0.7
-        if len(symmetric_ringing_asymmetry) > 0 and avg_symmetric_ringing_asymmetry < 0.3:
+        # Penalize symmetric ringing (high NCC + negative lobes on both sides)
+        # Use dynamic threshold based on high-frequency energy
+        dynamic_ncc_threshold = 0.9 if high_freq_energy > 0.15 else 0.7
+        ncc_asymmetry_threshold = 1.0 - dynamic_ncc_threshold  # Convert to asymmetry threshold
+        
+        if len(symmetric_ringing_asymmetry) > 0 and avg_symmetric_ringing_asymmetry < ncc_asymmetry_threshold:
             symmetric_count = len(symmetric_ringing_asymmetry)
             symmetric_ratio = symmetric_count / len(esf_samples) if esf_samples else 0.0
             
             # Calculate average NCC for symmetric ringing cases (stored directly)
-            avg_symmetric_ncc = np.mean(symmetric_ringing_ncc) if symmetric_ringing_ncc else 0.7
+            avg_symmetric_ncc = np.mean(symmetric_ringing_ncc) if symmetric_ringing_ncc else dynamic_ncc_threshold
+            
+            # CA INTEGRATION: If CA is radial, reduce AI penalty by 50%
+            # Real lenses can have symmetric PSFs, but they almost never have tangential CA
+            ca_penalty_reduction = 0.5 if (ca_is_radial is True) else 1.0
             
             violations.append(
                 f"Even-symmetric ringing detected (NCC: {avg_symmetric_ncc:.3f}, "
@@ -951,6 +1045,8 @@ class EdgePSFTest:
             # Penalty scales with NCC: higher NCC (more symmetric) = stronger penalty
             # NCC 0.7 → penalty factor 0.44, NCC 1.0 → penalty factor 0.2
             penalty_factor = max(0.2, 1.0 - avg_symmetric_ncc * 0.8)
+            # Apply CA penalty reduction if CA is radial
+            penalty_factor = 1.0 - (1.0 - penalty_factor) * ca_penalty_reduction
             score *= penalty_factor
         
         # Method 3: Phase & Parity Symmetry - High-confidence AI detection
@@ -970,18 +1066,32 @@ class EdgePSFTest:
         
         if phase_parity_ai_count > 0:
             # High-confidence AI indicator: zero-phase symmetric ringing
-            violations.append(
-                f"Zero-phase symmetric ringing detected (SR: {avg_sr:.3f}, PSI: {avg_psi:.3f}, "
-                f"{phase_parity_ai_ratio:.1%} of edges) - strong AI diffusion artifact indicator"
-            )
+            # UPDATED: Only use "Zero-phase synthetic artifact" text when PSI > 0.9
+            if avg_psi > 0.9:
+                violation_text = (
+                    f"Zero-phase synthetic artifact detected (SR: {avg_sr:.3f}, PSI: {avg_psi:.3f}, "
+                    f"{phase_parity_ai_ratio:.1%} of edges) - strong AI diffusion artifact indicator"
+                )
+            else:
+                violation_text = (
+                    f"Zero-phase symmetric ringing detected (SR: {avg_sr:.3f}, PSI: {avg_psi:.3f}, "
+                    f"{phase_parity_ai_ratio:.1%} of edges) - strong AI diffusion artifact indicator"
+                )
+            violations.append(violation_text)
+            
             # Very strong penalty for zero-phase symmetric ringing (physical optics rarely produce this)
             # Combined metric: (SR + PSI) / 2, penalize more when both are high
             combined_metric = (avg_sr + avg_psi) / 2.0
             penalty_factor = max(0.15, 1.0 - combined_metric * 0.85)  # Stronger penalty than NCC alone
+            
+            # CA INTEGRATION: If CA is radial, reduce AI penalty by 50%
+            ca_penalty_reduction = 0.5 if (ca_is_radial is True) else 1.0
+            penalty_factor = 1.0 - (1.0 - penalty_factor) * ca_penalty_reduction
+            
             score *= penalty_factor
             logger.debug(
                 f"Applied zero-phase ringing penalty: combined_metric={combined_metric:.3f}, "
-                f"penalty_factor={penalty_factor:.3f}"
+                f"penalty_factor={penalty_factor:.3f}, ca_penalty_reduction={ca_penalty_reduction:.2f}"
             )
         
         # Note: High asymmetry (> 0.5) is actually less suspicious (real ISP sharpening)
@@ -1043,6 +1153,11 @@ class EdgePSFTest:
         )
 
 
+# ============================================================================
+# TEST 3: DEPTH-OF-FIELD CONSISTENCY TEST
+# ============================================================================
+# Estimates local blur radius at edges (content-independent) and checks
+# spatial smoothness of blur variation. Real DOF follows the thin lens equation.
 @pydantic_dataclass
 class DepthOfFieldConsistencyTest:
     """Test 3: Depth-of-field consistency test.
@@ -1884,6 +1999,11 @@ class DepthOfFieldConsistencyTest:
         )
 
 
+# ============================================================================
+# TEST 5: SENSOR NOISE RESIDUAL TEST
+# ============================================================================
+# Distinguishes real camera sensor data from AI-generated images by analyzing
+# the spatial correlation structure of noise residuals.
 @pydantic_dataclass
 class SensorNoiseResidualTest:
     """Test 5: Sensor Noise Residual Test.
@@ -2282,6 +2402,11 @@ class SensorNoiseResidualTest:
             )
 
 
+# ============================================================================
+# TEST 4: CHROMATIC ABERRATION TEST
+# ============================================================================
+# Computes edge offsets between R/G/B channels and checks for
+# radial consistency. Note: Modern phones correct CA in ISP.
 @pydantic_dataclass
 class ChromaticAberrationTest:
     """Test 4: Chromatic aberration test.
@@ -2406,7 +2531,8 @@ class ChromaticAberrationTest:
 
         rg_offsets = []
         bg_offsets = []
-        radial_distances = []
+        rg_radial_distances = []  # Radial distances for R-G offsets
+        bg_radial_distances = []  # Radial distances for B-G offsets
         rg_offset_vectors = []  # Store tuples: (offset_vec, (y, x)) for radial alignment check
         bg_offset_vectors = []  # Store tuples: (offset_vec, (y, x)) for radial alignment check
 
@@ -2506,7 +2632,7 @@ class ChromaticAberrationTest:
                 rg_offset = abs(r_shift)  # Magnitude
                 
                 rg_offsets.append(rg_offset)
-                radial_distances.append(radial_dist)  # Only append if we found R offset
+                rg_radial_distances.append(radial_dist)  # Track radial distance for R-G offset
                 offset_vec = np.array([r_offset_x, r_offset_y])
                 rg_offset_vectors.append((offset_vec, (y, x)))
             else:
@@ -2546,6 +2672,7 @@ class ChromaticAberrationTest:
                 bg_offset = abs(b_shift)
                 
                 bg_offsets.append(bg_offset)
+                bg_radial_distances.append(radial_dist)  # Track radial distance for B-G offset
                 offset_vec = np.array([b_offset_x, b_offset_y])
                 bg_offset_vectors.append((offset_vec, (y, x)))
             else:
@@ -2561,6 +2688,16 @@ class ChromaticAberrationTest:
         violations = []
         score = 1.0
         confidence_factor = test_confidence  # Will scale final score
+        
+        # Initialize proportionality fit results (for diagnostic data)
+        proportionality_fits = {
+            'rg_slope': None,
+            'rg_intercept': None,
+            'rg_r_squared': None,
+            'bg_slope': None,
+            'bg_intercept': None,
+            'bg_r_squared': None,
+        }
 
         # REMOVED: Zero CA check
         # Modern phones correct CA in ISP, so low/zero CA is expected, not suspicious
@@ -2572,22 +2709,125 @@ class ChromaticAberrationTest:
             f"(low magnitude is normal after ISP correction)"
         )
 
-        # Check for radial consistency (ONLY on original resolution images)
-        # Subpixel CA cues are destroyed by resizing/re-encoding
-        if can_test_radial and len(radial_distances) == len(rg_offsets):
-            # Fit linear relationship: offset = a * radius + b
+        # RADIAL PROPORTIONALITY TEST: Real lateral CA magnitude is proportional to radial distance
+        # 
+        # PHYSICS: Real lateral CA follows: |offset| ∝ r (proportional, not just linear)
+        # This means: offset = k * r (intercept should be near zero)
+        # 
+        # FORENSIC TEST: Fit offset = a * r + b and check:
+        # 1. Slope a > 0 (positive, increasing with distance)
+        # 2. Intercept b ≈ 0 (proportional relationship, not just linear)
+        # 3. Good fit quality (R² > 0.3) - validates the relationship exists
+        #
+        # IMPORTANT: Only evaluate on original resolution images (subpixel CA destroyed by resizing)
+        if can_test_radial and len(rg_radial_distances) >= 10 and len(bg_radial_distances) >= 10:
+            logger.debug("Testing CA radial proportionality (magnitude ∝ r)...")
+            
+            # Helper function to compute R² (coefficient of determination)
+            def compute_r_squared(y_true, y_pred):
+                ss_res = np.sum((y_true - y_pred) ** 2)
+                ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+                if ss_tot < 1e-10:
+                    return 0.0
+                return 1.0 - (ss_res / ss_tot)
+            
+            # Test R-G proportionality
             try:
-                rg_slope, _ = np.polyfit(radial_distances[: len(rg_offsets)], rg_offsets, deg=1)
-                if rg_slope < -0.01:  # Negative slope is non-physical
-                    violations.append("Non-physical CA radial variation (negative slope)")
+                rg_radial = np.array(rg_radial_distances)
+                rg_offsets_arr = np.array(rg_offsets)
+                
+                # Fit: offset = a * r + b
+                rg_slope, rg_intercept = np.polyfit(rg_radial, rg_offsets_arr, deg=1)
+                rg_predicted = rg_slope * rg_radial + rg_intercept
+                rg_r_squared = compute_r_squared(rg_offsets_arr, rg_predicted)
+                
+                # Store for diagnostic data
+                proportionality_fits['rg_slope'] = float(rg_slope)
+                proportionality_fits['rg_intercept'] = float(rg_intercept)
+                proportionality_fits['rg_r_squared'] = float(rg_r_squared)
+                
+                logger.debug(
+                    f"R-G CA fit: slope={rg_slope:.6f}, intercept={rg_intercept:.6f}, R²={rg_r_squared:.3f}"
+                )
+                
+                # Check 1: Negative slope is non-physical
+                if rg_slope < -0.01:
+                    violations.append(
+                        f"Non-physical CA radial variation (R-G slope: {rg_slope:.4f} < 0) - "
+                        f"CA magnitude should increase with distance from center"
+                    )
                     score *= 0.5
-            except Exception:
-                pass
+                
+                # Check 2: Non-proportional relationship (intercept too large)
+                # For proportionality, intercept should be near zero relative to typical offset
+                mean_rg_offset = np.mean(rg_offsets_arr)
+                if mean_rg_offset > 1e-3:  # Only check if there's meaningful CA
+                    intercept_ratio = abs(rg_intercept) / mean_rg_offset
+                    if intercept_ratio > 0.3:  # Intercept > 30% of mean offset (non-proportional)
+                        violations.append(
+                            f"Non-proportional CA relationship (R-G intercept ratio: {intercept_ratio:.2f}) - "
+                            f"real CA should follow |offset| ∝ r (intercept ≈ 0)"
+                        )
+                        score *= max(0.4, 1.0 - intercept_ratio)
+                
+                # Check 3: Poor fit quality (weak relationship)
+                if rg_r_squared < 0.3 and mean_rg_offset > 0.1:  # Only penalize if CA is significant
+                    violations.append(
+                        f"Weak CA radial relationship (R-G R²: {rg_r_squared:.3f} < 0.3) - "
+                        f"CA magnitude should correlate with radial distance"
+                    )
+                    score *= max(0.5, rg_r_squared * 2)
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fit R-G CA proportionality: {e}")
+            
+            # Test B-G proportionality (same checks)
+            try:
+                bg_radial = np.array(bg_radial_distances)
+                bg_offsets_arr = np.array(bg_offsets)
+                
+                bg_slope, bg_intercept = np.polyfit(bg_radial, bg_offsets_arr, deg=1)
+                bg_predicted = bg_slope * bg_radial + bg_intercept
+                bg_r_squared = compute_r_squared(bg_offsets_arr, bg_predicted)
+                
+                # Store for diagnostic data
+                proportionality_fits['bg_slope'] = float(bg_slope)
+                proportionality_fits['bg_intercept'] = float(bg_intercept)
+                proportionality_fits['bg_r_squared'] = float(bg_r_squared)
+                
+                logger.debug(
+                    f"B-G CA fit: slope={bg_slope:.6f}, intercept={bg_intercept:.6f}, R²={bg_r_squared:.3f}"
+                )
+                
+                if bg_slope < -0.01:
+                    violations.append(
+                        f"Non-physical CA radial variation (B-G slope: {bg_slope:.4f} < 0)"
+                    )
+                    score *= 0.5
+                
+                mean_bg_offset = np.mean(bg_offsets_arr)
+                if mean_bg_offset > 1e-3:
+                    intercept_ratio = abs(bg_intercept) / mean_bg_offset
+                    if intercept_ratio > 0.3:
+                        violations.append(
+                            f"Non-proportional CA relationship (B-G intercept ratio: {intercept_ratio:.2f})"
+                        )
+                        score *= max(0.4, 1.0 - intercept_ratio)
+                
+                if bg_r_squared < 0.3 and mean_bg_offset > 0.1:
+                    violations.append(
+                        f"Weak CA radial relationship (B-G R²: {bg_r_squared:.3f} < 0.3)"
+                    )
+                    score *= max(0.5, bg_r_squared * 2)
+                    
+            except Exception as e:
+                logger.warning(f"Failed to fit B-G CA proportionality: {e}")
+                
         else:
             # Cannot test radial consistency on resized images
             logger.debug(
-                "Skipping radial consistency test - image likely resized/re-encoded "
-                "(subpixel CA cues destroyed)"
+                "Skipping radial proportionality test - image likely resized/re-encoded "
+                "(subpixel CA cues destroyed) or insufficient samples"
             )
 
         # Check for symmetric fake CA (all offsets in same direction)
@@ -2668,6 +2908,10 @@ class ChromaticAberrationTest:
             # Check alignment scores (only if we have enough data)
             # Real CA: alignment close to ±1 (radial)
             # AI/fake CA: alignment close to 0 (tangential/sideways)
+            is_radial = True  # Default to True (radial) if we can't test
+            mean_alignment_rg = 0.0
+            mean_alignment_bg = 0.0
+            
             if len(alignments_rg) > 5:
                 mean_alignment_rg = np.mean(np.abs(alignments_rg))
                 # If mean alignment < 0.7, CA is too tangential (non-physical)
@@ -2677,6 +2921,7 @@ class ChromaticAberrationTest:
                         f"offset vectors are tangential (sideways), not radial - AI artifact"
                     )
                     score *= max(0.3, mean_alignment_rg / self.ALIGNMENT_NORMALIZATION_FACTOR)
+                    is_radial = False  # Non-radial detected
             
             if len(alignments_bg) > 5:
                 mean_alignment_bg = np.mean(np.abs(alignments_bg))
@@ -2686,12 +2931,18 @@ class ChromaticAberrationTest:
                         f"offset vectors are tangential (sideways), not radial - AI artifact"
                     )
                     score *= max(0.3, mean_alignment_bg / self.ALIGNMENT_NORMALIZATION_FACTOR)
+                    is_radial = False  # Non-radial detected
+            
+            # If both alignments are good (>= 0.7), CA is radial
+            if len(alignments_rg) > 5 and len(alignments_bg) > 5:
+                is_radial = (mean_alignment_rg >= 0.7) and (mean_alignment_bg >= 0.7)
         else:
             # Cannot test radial alignment on resized images
             logger.debug(
                 "Skipping radial alignment test - image likely resized/re-encoded "
                 "(subpixel CA cues destroyed)"
             )
+            is_radial = None  # Unknown (can't test)
 
         # COLOR ORDER CONSISTENCY TEST: Refractive index relationship
         #
@@ -2795,17 +3046,30 @@ class ChromaticAberrationTest:
             diagnostic_data={
                 "rg_offsets": rg_offsets,
                 "bg_offsets": bg_offsets,
+                "rg_radial_distances": rg_radial_distances,
+                "bg_radial_distances": bg_radial_distances,
                 "test_confidence": test_confidence,
                 "can_test_radial": can_test_radial,
                 "original_resolution": original_resolution,
                 "current_resolution": (h, w),
-                "radial_distances": radial_distances[: len(rg_offsets)],
                 "mean_rg_offset": mean_rg_offset,
                 "mean_bg_offset": mean_bg_offset,
+                "is_radial": is_radial,  # True if CA is radial, False if tangential, None if can't test
+                # Proportionality fit results (None if not computed)
+                "rg_slope": proportionality_fits['rg_slope'],
+                "rg_intercept": proportionality_fits['rg_intercept'],
+                "rg_r_squared": proportionality_fits['rg_r_squared'],
+                "bg_slope": proportionality_fits['bg_slope'],
+                "bg_intercept": proportionality_fits['bg_intercept'],
+                "bg_r_squared": proportionality_fits['bg_r_squared'],
             },
         )
 
 
+# ============================================================================
+# MAIN DETECTOR: OPTICS CONSISTENCY DETECTOR
+# ============================================================================
+# Combines all five tests to produce an overall optics consistency score.
 @pydantic_dataclass
 class OpticsConsistencyDetector:
     """Main detector for optics consistency analysis.
@@ -2930,11 +3194,22 @@ class OpticsConsistencyDetector:
         frequency_result = self.frequency_test.test(preprocessed)
         logger.info(f"  ✓ Frequency test complete: score={frequency_result.score:.4f}")
 
-        logger.info("Step 4/6: Running edge PSF test...")
-        edge_psf_result = self.edge_psf_test.test(preprocessed)
+        # Run CA test early if RGB available (needed for edge PSF test CA integration)
+        ca_result = None
+        ca_is_radial = None
+        if image_rgb is not None:
+            logger.info("Step 4/6: Running chromatic aberration test (this may take a moment)...")
+            ca_result = self.ca_test.test(image_rgb, original_resolution=original_resolution)
+            logger.info(f"  ✓ CA test complete: score={ca_result.score:.4f}")
+            # Extract CA radial alignment result from diagnostic data
+            ca_is_radial = ca_result.diagnostic_data.get('is_radial', None)
+
+        logger.info("Step 5/6: Running edge PSF test...")
+        # Pass CA radial alignment result to edge PSF test for integrated scoring
+        edge_psf_result = self.edge_psf_test.test(preprocessed, ca_is_radial=ca_is_radial)
         logger.info(f"  ✓ Edge PSF test complete: score={edge_psf_result.score:.4f}")
 
-        logger.info("Step 5/6: Running DOF consistency test (this may take a moment)...")
+        logger.info("Step 6/6: Running DOF consistency test (this may take a moment)...")
         # OPTIMIZED: Precompute gradient once and cache it (for potential reuse)
         self._get_cached_gradient(preprocessed)  # Precompute and cache
         # Note: DOF test will use its own gradient computation for now
@@ -2943,19 +3218,23 @@ class OpticsConsistencyDetector:
         logger.info(f"  ✓ DOF test complete: score={dof_result.score:.4f}")
 
         if image_rgb is not None:
-            logger.info("Step 6/6: Running chromatic aberration test (this may take a moment)...")
-            ca_result = self.ca_test.test(image_rgb, original_resolution=original_resolution)
-            logger.info(f"  ✓ CA test complete: score={ca_result.score:.4f}")
+            if ca_result is None:
+                # CA test not run yet (shouldn't happen, but handle gracefully)
+                logger.info("Step 6/6: Running chromatic aberration test (this may take a moment)...")
+                ca_result = self.ca_test.test(image_rgb, original_resolution=original_resolution)
+                logger.info(f"  ✓ CA test complete: score={ca_result.score:.4f}")
+                ca_is_radial = ca_result.diagnostic_data.get('is_radial', None)
             
             logger.info("Step 7/7: Running noise residual test (this may take a moment)...")
             noise_residual_result = self.noise_residual_test.test(image_rgb)
             logger.info(f"  ✓ Noise residual test complete: score={noise_residual_result.score:.4f}")
         else:
-            ca_result = OpticsTestResult(
-                score=0.5,
-                violations=["RGB image required for CA test"],
-                diagnostic_data={},
-            )
+            if ca_result is None:
+                ca_result = OpticsTestResult(
+                    score=0.5,
+                    violations=["RGB image required for CA test"],
+                    diagnostic_data={},
+                )
             noise_residual_result = OpticsTestResult(
                 score=0.5,
                 violations=["RGB image required for noise residual test"],
